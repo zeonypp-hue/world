@@ -1,0 +1,219 @@
+┌──(root㉿kali)-[/home/zeony/Downloads]
+└─# python3 recon_tool_v3\ \(1\).py krmk.org --format json --hard-mode
+
+════════════════════════════════════════════════════════════
+  RECONNAISSANCE FRAMEWORK v3.0 -- SMART PoC
+════════════════════════════════════════════════════════════
+  Target:    krmk.org
+  Output:    recon_results
+  Threads:   50
+  Hard mode: True
+  Nuclei:    YES
+  PoC:       YES
+  2ip token: NO
+  GitHub:    NO
+  Vulners:   NO (public)
+
+[!] Опционально: testssl.sh не найден (apt install testssl.sh)
+[+] Зависимости OK.
+
+════════════════════════════════════════════════════════════
+  OS DETECTION
+════════════════════════════════════════════════════════════
+[+] [OS] Linux/Unix (TTL=53)
+
+════════════════════════════════════════════════════════════
+  BANNER GRAB
+════════════════════════════════════════════════════════════
+[+]   Port 21: 220 ProFTPD Server (Debian) [::ffff:92.63.178.27]
+[+]   Port 22: OpenSSH 8.2p1
+[+]   Port 25: 554 SMTP synchronization error
+[*]   Port 53: no banner
+[+]   Port 80: Apache 2.4.41
+[+]   Port 110: +OK Dovecot (Ubuntu) ready.
+-ERR Unknown command.
+[+]   Port 143: * OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE
+[+]   Port 443: Apache 2.4.41
+[*]   Port 465: no banner
+[+]   Port 587: 554 SMTP synchronization error
+[*]   Port 993: no banner
+[*]   Port 995: no banner
+[+]   Port 3306: EjHost '95.105.69.69' is not allowed to connect to this 
+[*]   Port 5432: no banner
+[*]   Port 6379: no banner
+[*]   Port 8080: no banner
+[*]   Port 8443: no banner
+[*]   Port 9000: no banner
+[*]   Port 9200: no banner
+[*]   Port 27017: no banner
+
+════════════════════════════════════════════════════════════
+  NMAP SCAN
+════════════════════════════════════════════════════════════
+[*] [Nmap] Fast scan: 92.63.178.27
+[+] [Nmap] Open ports: 14
+[*] [Nmap] Detailed: 14 ports on 92.63.178.27
+[+] [Nmap OS] Aruba IAP-93 WAP (accuracy: 93)
+
+════════════════════════════════════════════════════════════
+  SUBDOMAIN ENUMERATION
+════════════════════════════════════════════════════════════
+[*] [Subfinder] Streaming: krmk.org
+[*]   [Subfinder] www.krmk.org
+[*]   [Subfinder] www.do.krmk.org
+[*]   [Subfinder] old.krmk.org
+[*]   [Subfinder] do.krmk.org
+
+════════════════════════════════════════════════════════════
+  DNS ENUMERATION
+════════════════════════════════════════════════════════════
+[*] [DNS] krmk.org
+[+] [DNS] Records: 6
+
+════════════════════════════════════════════════════════════
+  TECHNOLOGY DETECTION
+════════════════════════════════════════════════════════════
+[*] [WhatWeb] http://krmk.org
+[-] [WhatWeb] err: Command '['whatweb', '-a', '3', 'http://krmk.org']' timed out after 120 seconds
+[*] [WhatWeb] https://krmk.org
+[-] [WhatWeb] err: Command '['whatweb', '-a', '3', 'https://krmk.org']' timed out after 120 seconds
+
+════════════════════════════════════════════════════════════
+  DIRECTORY BRUTE FORCE
+════════════════════════════════════════════════════════════
+[*] [Gobuster] Dir: http://krmk.org [http://krmk.org]
+[+] [Gobuster] Found: 0 [http://krmk.org]
+[*] [Gobuster] Dir: https://krmk.org [https://krmk.org]
+[-] Gobuster dir: Command '['gobuster', 'dir', '-u', 'https://krmk.org', '-w', '/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt', '-t', '50', '-o', '/tmp/gob_dir_3392913441_1790610678.txt', '-k', '--no-error', '-e']' timed out after 1800 seconds
+
+════════════════════════════════════════════════════════════
+  SENSITIVE FILE LEAK CHECK
+════════════════════════════════════════════════════════════
+[*] [LeakChecker] http://krmk.org
+[+] [LeakChecker] Found: 0
+[*] [LeakChecker] https://krmk.org
+[+] [LeakChecker] Found: 4
+
+════════════════════════════════════════════════════════════
+  CORS MISCONFIGURATION CHECK
+════════════════════════════════════════════════════════════
+[*] [CORS] Checking: http://krmk.org
+[*] [CORS] Checking: https://krmk.org
+
+════════════════════════════════════════════════════════════
+  SSL/TLS SCAN
+════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════
+  FAVICON EXTRACTION
+════════════════════════════════════════════════════════════
+[+]   http://krmk.org: MD5=e75c4f5076e15e49f4f923a233214de9, Size=94039 bytes
+[+]   https://krmk.org: MD5=e75c4f5076e15e49f4f923a233214de9, Size=94039 bytes
+
+════════════════════════════════════════════════════════════
+  NUCLEI SCAN
+════════════════════════════════════════════════════════════
+[*] [Nuclei] Scanning 4 URLs
+[+] [Nuclei] Scanned 4 URLs, findings: 0
+
+════════════════════════════════════════════════════════════
+  EXPLOIT SEARCH (Searchsploit)
+════════════════════════════════════════════════════════════
+[*] [Searchsploit] Searching: ftp
+[*] [Searchsploit] Searching: ProFTPD
+[*] [Searchsploit] Searching: Server
+[*] [Searchsploit] Searching: Debian
+[+] [Searchsploit] Found 517 unique exploits
+[*] [Searchsploit] Searching: OpenSSH 8.2p1
+[*] [Searchsploit] No exploits found
+[*] [Searchsploit] Searching: smtp
+[+] [Searchsploit] Found 17 unique exploits
+[*] [Searchsploit] Searching: Apache 2.4.41
+[+] [Searchsploit] Found 10 unique exploits
+[*] [Searchsploit] Searching: pop3
+[*] [Searchsploit] Searching: Dovecot
+[*] [Searchsploit] Searching: Ubuntu
+[+] [Searchsploit] Found 68 unique exploits
+[*] [Searchsploit] Searching: imap
+[*] [Searchsploit] Searching: CAPABILITY
+[*] [Searchsploit] Searching: IMAP4rev1
+[*] [Searchsploit] Searching: SASL-IR
+[+] [Searchsploit] Found 12 unique exploits
+[*] [Searchsploit] Searching: smtps
+[*] [Searchsploit] No exploits found
+[*] [Searchsploit] Searching: submission
+[+] [Searchsploit] Found 7 unique exploits
+[*] [Searchsploit] Searching: imaps
+[*] [Searchsploit] No specific exploits for generic 'imaps'
+[*] [Searchsploit] Searching: pop3s
+[*] [Searchsploit] No specific exploits for generic 'pop3s'
+[*] [Searchsploit] Searching: mysql
+[+] [Searchsploit] Found 52 unique exploits
+[*] [Searchsploit] Searching: zabbix-agent
+[*] [Searchsploit] No exploits found
+[*] [Searchsploit] Searching: mysqlx
+[*] [Searchsploit] No exploits found
+
+════════════════════════════════════════════════════════════
+  METASPLOIT MODULE SEARCH
+════════════════════════════════════════════════════════════
+[*] [Metasploit] Searching: ftp
+[+] [Metasploit] Found 384 unique modules for ftp
+[*] [Metasploit] Searching: OpenSSH 8.2p1
+[*] [Metasploit] Searching: OpenSSH
+[+] [Metasploit] Found 6 unique modules for OpenSSH 8.2p1
+[*] [Metasploit] Searching: smtp
+[+] [Metasploit] Found 42 unique modules for smtp
+[*] [Metasploit] Searching: Apache 2.4.41
+[*] [Metasploit] Searching: Apache
+[+] [Metasploit] Found 142 unique modules for Apache 2.4.41
+[*] [Metasploit] Searching: pop3
+[+] [Metasploit] Found 8 unique modules for pop3
+[*] [Metasploit] Searching: imap
+[+] [Metasploit] Found 24 unique modules for imap
+[*] [Metasploit] Searching: smtps
+[*] [Metasploit] Searching: submission
+[+] [Metasploit] Found 4 unique modules for submission
+[*] [Metasploit] Searching: imaps
+[*] [Metasploit] Searching: pop3s
+[*] [Metasploit] Searching: mysql
+[+] [Metasploit] Found 39 unique modules for mysql
+[*] [Metasploit] Searching: zabbix-agent
+[*] [Metasploit] Searching: mysqlx
+
+════════════════════════════════════════════════════════════
+  HARD MODE: VHOST BRUTE FORCE
+════════════════════════════════════════════════════════════
+[*] [VHost] 92.63.178.27 (base: krmk.org)
+[-] [VHost] wl prep: [Errno 2] No such file or directory: '/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt'
+
+════════════════════════════════════════════════════════════
+  PoC VERIFICATION
+════════════════════════════════════════════════════════════
+[!] [KEV] Failed to load catalog: HTTPSConnectionPool(host='api.cisa.gov', port=443): Max retries exceeded with url: /known-exploited-vulnerabilities/catalog (Caused by NameResolutionError("HTTPSConnection(host='api.cisa.gov', port=443): Failed to resolve 'api.cisa.gov' ([Errno -5] No address associated with hostname)"))
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[!] [GitHub] Rate limit exceeded, skipping GitHub PoC search
+[+] [PoC] Done: 1V/0NV/15U/0E/0B/277S (total 298)
+
+════════════════════════════════════════════════════════════
+  SAVING RESULTS
+════════════════════════════════════════════════════════════
+[+] [Save] JSON: recon_results/recon_krmk.org_20260928_192309.json
+
+════════════════════════════════════════════════════════════
+  SCAN COMPLETE
+════════════════════════════════════════════════════════════
+  Results saved to: recon_results
+  Format: json
+  PoC Summary: 1V/0NV/15U/0E/0B/277S (total 298)
+
