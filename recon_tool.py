@@ -277,6 +277,120 @@ def find_first_existing(paths):
     return None
 
 
+def save_resume_state(output_dir, target, stage, results_so_far, args_ns=None):
+    """Промежуточный state: переживает падение, --resume подхватывает."""
+    state_file = os.path.join(output_dir, f".resume_state_{target}.json")
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        payload = {
+            "stage": stage,
+            "updated": datetime.now().isoformat(),
+            "results": results_so_far,
+        }
+        if args_ns is not None:
+            payload["args"] = {k: v for k, v in vars(args_ns).items()}
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, default=str)
+    except Exception as e:
+        log_warning(f"[Resume] Could not save state: {e}")
+
+
+def load_resume_state(output_dir, target):
+    state_file = os.path.join(output_dir, f".resume_state_{target}.json")
+    try:
+        if os.path.exists(state_file):
+            with open(state_file, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log_warning(f"[Resume] Could not load state: {e}")
+    return None
+
+
+def clear_resume_state(output_dir, target):
+    state_file = os.path.join(output_dir, f".resume_state_{target}.json")
+    try:
+        if os.path.exists(state_file):
+            os.remove(state_file)
+    except Exception:
+        pass
+
+
+def generate_html_report(results, poc_results, out_file):
+    """Человекочитаемый HTML-отчёт с сортировкой PoC по confidence."""
+    STATUS_COLORS = {
+        "vulnerable": "#d32f2f", "not_vulnerable": "#2e7d32", "unknown": "#9e9e9e",
+        "error": "#f57c00", "blocked": "#7b1fa2", "skipped": "#bdbdbd", "info": "#1976d2",
+    }
+    def esc(s):
+        return (str(s) if s is not None else "").replace("&", "&amp;").replace(
+            "<", "&lt;").replace(">", "&gt;")
+
+    all_checks = list((poc_results or {}).get("main", []))
+    for sub_checks in (poc_results or {}).get("subdomains", {}).values():
+        all_checks.extend(sub_checks)
+    for sub_checks in (poc_results or {}).get("hard_mode_subdomains", {}).values():
+        all_checks.extend(sub_checks)
+    all_checks.sort(key=lambda c: -(c.get("confidence") or 0))
+
+    rows = []
+    for c in all_checks:
+        color = STATUS_COLORS.get(c.get("status", "unknown"), "#9e9e9e")
+        rows.append(f"""
+        <tr>
+          <td><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:{color}"></span></td>
+          <td><b>{esc(c.get('vulnerability'))}</b></td>
+          <td>{esc(c.get('target'))}</td>
+          <td>{c.get('confidence', 0)}</td>
+          <td>{esc(c.get('epss', ''))}</td>
+          <td>{'KEV' if c.get('kev') else ''}</td>
+          <td>{esc(c.get('status'))}</td>
+          <td>{esc(c.get('details', ''))[:200]}</td>
+        </tr>""")
+
+    ports_rows = []
+    for p in (results.get("detailed_ports") or []):
+        svc = p.get("service", {})
+        ports_rows.append(f"<tr><td>{esc(p.get('port'))}</td><td>{esc(p.get('protocol'))}</td>"
+                          f"<td>{esc(svc.get('name'))}</td><td>{esc(svc.get('product'))}</td>"
+                          f"<td>{esc(svc.get('version'))}</td><td>{esc(svc.get('banner', ''))[:80]}</td></tr>")
+
+    vuln_count = sum(1 for c in all_checks if c.get("status") == "vulnerable")
+    html = f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Recon Report — {esc(results.get('target'))}</title>
+<style>
+ body {{ font-family: -apple-system, 'Segoe UI', sans-serif; margin: 40px; color: #212121; }}
+ h1 {{ border-bottom: 3px solid #1976d2; padding-bottom: 8px; }}
+ table {{ border-collapse: collapse; width: 100%; margin: 16px 0; }}
+ th, td {{ border: 1px solid #e0e0e0; padding: 6px 10px; text-align: left; font-size: 13px; }}
+ th {{ background: #f5f5f5; }}
+ .stat {{ display: inline-block; background: #f5f5f5; border-radius: 8px; padding: 12px 20px; margin-right: 12px; }}
+ .stat b {{ font-size: 22px; display: block; }}
+</style></head><body>
+<h1>Recon Report — {esc(results.get('target'))}</h1>
+<p>Сгенерирован: {esc(results.get('timestamp'))} | IP: {esc(results.get('ip'))} |
+ OS: {esc((results.get('os') or {}).get('name', 'n/a'))}</p>
+<div>
+ <span class="stat"><b>{vuln_count}</b>подтверждённых уязвимостей</span>
+ <span class="stat"><b>{len(all_checks)}</b>проверок всего</span>
+ <span class="stat"><b>{len(results.get('detailed_ports') or [])}</b>открытых портов</span>
+ <span class="stat"><b>{len(results.get('subdomains') or [])}</b>субдоменов</span>
+</div>
+<h2>Открытые порты</h2>
+<table><tr><th>Port</th><th>Proto</th><th>Service</th><th>Product</th><th>Version</th><th>Banner</th></tr>
+{''.join(ports_rows)}</table>
+<h2>PoC-проверки (по confidence)</h2>
+<table><tr><th></th><th>Vulnerability</th><th>Target</th><th>Confidence</th><th>EPSS</th><th>KEV</th><th>Status</th><th>Details</th></tr>
+{''.join(rows)}</table>
+</body></html>"""
+    try:
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(html)
+        log_success(f"[Save] HTML: {out_file}")
+    except Exception as e:
+        log_error(f"[Save] HTML failed: {e}")
+
+
 def banner_grab_ports(ip, ports, timeout=5, max_workers=10):
     """Параллельный banner grab: последовательный опрос 20 портов
     может занять до 100с, с пулом потоков — один timeout."""
@@ -573,6 +687,119 @@ class EPSSKEVClient:
         return epss, kev, combined
 
 
+class NVDRangesClient:
+    """Диапазоны уязвимых версий из NVD 2.0 API (criterions CPE).
+    Кэш на диск (30 дней): NVD rate limit 5 запросов без ключа / 50 с ключом."""
+
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.verify = False
+        self.session.headers.update({"Accept": "application/json"})
+        if api_key:
+            self.session.headers["apiKey"] = api_key
+        self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "recon_framework")
+        self.cache_file = os.path.join(self.cache_dir, "nvd_ranges.json")
+        self._cache = None
+        self._pending = {}  # cve -> [(min, min_incl, max, max_incl, product_hint), ...]
+        self._fetched = set()
+        self._warned = False
+
+    def _load(self):
+        if self._cache is not None:
+            return
+        self._cache = {}
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file) as f:
+                    raw = json.load(f)
+                if time.time() - os.path.getmtime(self.cache_file) < 30 * 86400:
+                    self._cache = {k.upper(): v for k, v in raw.items()}
+                else:
+                    os.remove(self.cache_file)
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(self.cache_file, "w") as f:
+                json.dump(self._cache, f)
+        except Exception:
+            pass
+
+    def prefetch(self, cves):
+        """Загрузить диапазоны для списка CVE пачками по 10."""
+        self._load()
+        todo = [c.upper() for c in cves
+                if re.match(r"^CVE-\d{4}-\d+$", str(c)) and c.upper() not in self._cache]
+        todo = list(dict.fromkeys(todo))
+        for i in range(0, len(todo), 10):
+            chunk = todo[i:i + 10]
+            try:
+                r = self.session.get(
+                    "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                    params={"cveId": chunk[0]}, timeout=30)
+                # Bulk endpoint: по одному cveId за запрос; берём первый из чанка,
+                # остальные дотянутся лениво в get_range()
+                if r.status_code == 200:
+                    self._ingest(r.json())
+                elif r.status_code == 403 and not self._warned:
+                    log_warning("[NVD] Rate limit (без ключа 5 запросов/30с); диапазоны из локального кэша")
+                    self._warned = True
+                    time.sleep(6)
+            except Exception as e:
+                if not self._warned:
+                    log_warning(f"[NVD] Unavailable: {e}")
+                    self._warned = True
+                break
+        self._save()
+
+    def _ingest(self, data):
+        for vuln in data.get("vulnerabilities", []):
+            cve_obj = vuln.get("cve", {})
+            cve_id = (cve_obj.get("id") or "").upper()
+            if not cve_id:
+                continue
+            ranges = []
+            for conf in cve_obj.get("configurations", []):
+                for node in conf.get("nodes", []):
+                    for cpe_match in node.get("cpeMatch", []):
+                        crit = cpe_match.get("criteria", "")
+                        m = re.search(r"cpe:2\.3:[^:]+:[^:]+:([^:]+):([^:]+)", crit)
+                        if not m:
+                            continue
+                        prod_hint, ver = m.group(1).lower(), m.group(2)
+                        if ver in ("*", "-"):
+                            continue
+                        ranges.append({
+                            "product": prod_hint,
+                            "min": cpe_match.get("versionStartIncluding"),
+                            "max": cpe_match.get("versionEndIncluding"),
+                        })
+            if ranges:
+                self._cache[cve_id] = ranges
+            else:
+                self._cache[cve_id] = []
+
+    def get_ranges(self, cve):
+        """Диапазоны CVE: сначала локальный статический словарь (точные
+        min/max), потом NVD-кэш."""
+        cu = str(cve).upper()
+        self._load()
+        if cu in self._cache:
+            return self._cache[cu]
+        try:
+            r = self.session.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
+                                 params={"cveId": cu}, timeout=30)
+            if r.status_code == 200:
+                self._ingest(r.json())
+                self._save()
+        except Exception:
+            pass
+        return self._cache.get(cu)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # GITHUB PoC FINDER (НОВОЕ)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -662,6 +889,7 @@ class ConfidenceEngine:
     def __init__(self, vulners_engine, epss_kev_client):
         self.vulners = vulners_engine
         self.epss_kev = epss_kev_client
+        self.nvd = NVDRangesClient()
         self._version_cache = {}
 
     def score(self, service_info, cve, exploit_source="generic"):
@@ -759,6 +987,7 @@ class ConfidenceEngine:
         }
 
     def _get_vulnerable_version_range(self, cve, product):
+        """Локальный статический словарь (точные min/max) -> NVD API."""
         ranges = {
             "cve-2021-44228": {"product": ["log4j", "log4shell"], "min": None, "max": "2.14.1"},
             "cve-2021-41773": {"product": ["apache", "httpd"], "min": "2.4.49", "max": "2.4.49"},
@@ -801,6 +1030,16 @@ class ConfidenceEngine:
 
         cve_lower = cve.lower()
         if cve_lower not in ranges:
+            # Fallback: диапазоны из NVD (кэшируются на диск)
+            product_lower = (product or "").lower()
+            nvd_ranges = self.nvd.get_ranges(cve)
+            if not nvd_ranges:
+                return None
+            # берём первый диапазон, где продукт совпадает или неизвестен
+            for r in nvd_ranges:
+                hint = (r.get("product") or "").lower()
+                if not hint or not product_lower or hint in product_lower or product_lower in hint:
+                    return {"min": r.get("min"), "max": r.get("max")}
             return None
 
         info = ranges[cve_lower]
@@ -1616,6 +1855,50 @@ class NucleiScanner:
             if os.path.exists(url_file):
                 os.remove(url_file)
 
+    def check_cve(self, url, cve, timeout=120):
+        """Точечная проверка одного CVE nuclei-шаблоном (fallback, когда
+        нет встроенного check и метаплоты). Требует установленный nuclei."""
+        if not is_tool_installed("nuclei"):
+            return None
+        cve_upper = str(cve).upper()
+        if not re.match(r"^CVE-\d{4}-\d+$", cve_upper):
+            return None
+        try:
+            r = subprocess.run(
+                ["nuclei", "-u", url, "-tags", "cve", "-id", cve_upper,
+                 "-json", "-silent", "-no-color"],
+                capture_output=True, text=True, timeout=timeout)
+            findings = []
+            for line in (r.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    findings.append(json.loads(line))
+                except Exception:
+                    pass
+            if findings:
+                return {
+                    "target": url, "vulnerability": cve_upper, "type": "cve",
+                    "status": "vulnerable",
+                    "details": f"nuclei template matched ({len(findings)} finding(s))",
+                    "method": "nuclei_cve_check",
+                    "timestamp": datetime.now().isoformat(),
+                    "raw_output": json.dumps(findings[:3])[:500]
+                }
+            # Шаблон существует и не сработал: exit 0 без вывода
+            if r.returncode == 0:
+                return {
+                    "target": url, "vulnerability": cve_upper, "type": "cve",
+                    "status": "not_vulnerable",
+                    "details": "nuclei template ran, no match",
+                    "method": "nuclei_cve_check",
+                    "timestamp": datetime.now().isoformat()
+                }
+            return None  # шаблона нет или ошибка — не считаем результатом
+        except Exception:
+            return None
+
 
 class PoCVerifier:
     """Smart PoC Verifier v3.0 with Confidence Engine"""
@@ -1634,6 +1917,7 @@ class PoCVerifier:
         self.epss_kev = epss_kev_client or EPSSKEVClient()
         self.github = github_finder or GitHubPoCFinder()
         self.confidence = ConfidenceEngine(self.vulners, self.epss_kev)
+        self._nuclei = NucleiScanner()
         self.waf_signatures = {
             "cloudflare": ["cloudflare", "cf-ray", "cf-cache-status"],
             "modsecurity": ["mod_security", "modsecurity", "406 not acceptable"],
@@ -1949,6 +2233,16 @@ class PoCVerifier:
         web_result = self._check_cve_by_id(url, cve, context)
         if web_result:
             web_result["label"] = label; results.append(web_result)
+        # Fallback: нет встроенного check и метаплоты не дали результата —
+        # пробуем nuclei-шаблон этого CVE (покрытие: тысячи CVE).
+        if conf.get("score", 0) >= 50 and not web_result and not results:
+            nuclei_res = self._nuclei.check_cve(url, cve)
+            if nuclei_res:
+                nuclei_res["label"] = label
+                if conf:
+                    nuclei_res["confidence"] = conf.get("score")
+                results.append(nuclei_res)
+                log_info(f"[PoC] nuclei fallback for {cve} on {url}: {nuclei_res['status']}")
         if not results or all(r.get("status") in ("unknown", "not_vulnerable") for r in results):
             github_pocs = self.github.find_poc(cve)
             if github_pocs:
@@ -2096,6 +2390,25 @@ class PoCVerifier:
 
     def _parse_msf_check_output(self, output):
         out_lower = output.lower()
+        # Приоритет: явный CheckCode из метаплоты (Vulnerable=1, Safe=0,
+        # Unsupported/Unknown>1) — он надёжнее текстовых паттернов.
+        m = re.search(r"checkcode\s*::?\s*(?:checkcode|)?\s*(vulnerable|safe|unsupported|unknown)\b", out_lower)
+        if not m:
+            m = re.search(r"check\s*code\s*[:=]?\s*(\d+)", out_lower)
+            if m:
+                code = m.group(1)
+                if code == "1":
+                    return "vulnerable", "CheckCode::Vulnerable (target is exploitable)"
+                if code == "0":
+                    return "not_vulnerable", "CheckCode::Safe (target is not vulnerable)"
+                return "unknown", f"CheckCode::{code} (unknown/unsupported)"
+        else:
+            word = m.group(1)
+            if word == "vulnerable":
+                return "vulnerable", "CheckCode::Vulnerable (target is exploitable)"
+            if word == "safe":
+                return "not_vulnerable", "CheckCode::Safe (target is not vulnerable)"
+            return "unknown", f"CheckCode::{word.title()}"
         pos_patterns = [
             ("the target is vulnerable", "vulnerable", "Metasploit check confirmed: target IS VULNERABLE"),
             ("target is vulnerable", "vulnerable", "Metasploit check confirmed: target IS VULNERABLE"),
@@ -2582,7 +2895,10 @@ def main():
     parser.add_argument("--github-token", default=None, help="GitHub API token for PoC search")
     parser.add_argument("--vulners-api-key", default=None, help="Vulners API key")
     parser.add_argument("--format", choices=["json", "csv", "all"], default="all", help="Output format: json, csv, or all")
+    parser.add_argument("--format-html", action="store_true", help="Also generate HTML report")
     parser.add_argument("--dir-timeout", type=int, default=900, help="Directory brute force timeout (seconds)")
+    parser.add_argument("--resume", action="store_true", help="Resume from saved state (.resume_state_TARGET.json)")
+    parser.add_argument("--nvd-api-key", default=os.environ.get("NVD_API_KEY"), help="NVD API key (range checks)")
     args = parser.parse_args()
 
     if args.no_color:
@@ -2603,6 +2919,13 @@ def main():
     check_deps()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    resume_state = load_resume_state(args.output_dir, target) if args.resume else None
+    if resume_state:
+        log_success(f"[Resume] Restoring scan from stage '{resume_state.get('stage')}' "
+                    f"({resume_state.get('updated')})")
+    else:
+        resume_state = None
+
     target = args.target
     is_ip_target = is_ip(target)
     ip = target if is_ip_target else resolve_ip(target)
@@ -2617,10 +2940,17 @@ def main():
     epss_kev = EPSSKEVClient()
     github_finder = GitHubPoCFinder(token=args.github_token)
     poc_verifier = PoCVerifier(vulners_engine, epss_kev, github_finder)
+    poc_verifier.confidence.nvd = NVDRangesClient(api_key=args.nvd_api_key)
+
+    def save_stage(stage, payload):
+        save_resume_state(args.output_dir, target, stage, payload, args)
 
     # OS Detection
     log_section("OS DETECTION")
-    os_info = os_guess_by_ttl(ip)
+    if resume_state and (resume_state.get("results", {}) or {}).get("os"):
+        os_info = resume_state["results"]["os"]
+    else:
+        os_info = os_guess_by_ttl(ip)
     if os_info:
         log_success(f"[OS] {os_info['name']}")
     else:
@@ -2665,11 +2995,22 @@ def main():
 
     # Nmap
     log_section("NMAP SCAN")
-    nmap = NmapScanner()
-    open_ports = nmap.scan_ports(ip)
-    if not open_ports:
-        log_warning("No open ports found")
-    detailed = nmap.detailed_scan(ip, open_ports)
+    if resume_state and (resume_state.get("results", {}) or {}).get("detailed_ports") is not None:
+        rs = resume_state["results"]
+        open_ports = rs.get("ports", [])
+        detailed = {"ports": rs.get("detailed_ports", []), "os": rs.get("nmap_os"),
+                    "cpe_cves": rs.get("cpe_cves", [])}
+        log_info(f"[Resume] Using saved nmap results: {len(open_ports)} ports")
+        nmap = NmapScanner()
+    else:
+        nmap = NmapScanner()
+        open_ports = nmap.scan_ports(ip)
+        if not open_ports:
+            log_warning("No open ports found")
+        detailed = nmap.detailed_scan(ip, open_ports)
+        save_stage("nmap", {"ports": open_ports, "detailed_ports": detailed.get("ports", []),
+                            "nmap_os": detailed.get("os"), "cpe_cves": detailed.get("cpe_cves", []),
+                            "os": os_info})
     detailed_ports = detailed.get("ports", [])
     cpe_cves = detailed.get("cpe_cves", [])
     nmap_os = detailed.get("os")
@@ -2784,6 +3125,9 @@ def main():
         log_section("NUCLEI SCAN")
         nuclei = NucleiScanner()
         nuclei_results = nuclei.scan_urls(urls_to_scan, args.output_dir, threads=args.threads)
+        save_stage("nuclei", {"ports": open_ports, "detailed_ports": detailed_ports,
+                              "nmap_os": nmap_os, "cpe_cves": cpe_cves, "os": os_info,
+                              "nuclei": nuclei_results or []})
     else:
         log_warning("[Nuclei] Skipped")
 
@@ -2796,6 +3140,10 @@ def main():
     log_section("METASPLOIT MODULE SEARCH")
     msf_finder = MetasploitFinder()
     metasploit = msf_finder.scan_services(detailed_ports)
+    save_stage("exploits", {"ports": open_ports, "detailed_ports": detailed_ports,
+                            "nmap_os": nmap_os, "cpe_cves": cpe_cves, "os": os_info,
+                            "nuclei": (nuclei_results or []),
+                            "exploits": exploits, "metasploit": metasploit})
 
     # Hard mode
     hard_mode_subdomains = {}
@@ -2826,6 +3174,18 @@ def main():
     poc_results = None
     if not args.skip_poc:
         log_section("PoC VERIFICATION")
+        # Prefetch диапазонов NVD для всех известных CVE (один пул запросов)
+        try:
+            nvd_cves = {item.get("cve") for item in (cpe_cves or []) if isinstance(item, dict) and item.get("cve")}
+            for finding in (nuclei_results or []):
+                if isinstance(finding, dict):
+                    cve = finding.get("cve") or finding.get("template-id") or finding.get("templateID")
+                    if cve and "CVE-" in str(cve).upper():
+                        nvd_cves.add(str(cve).upper())
+            if nvd_cves:
+                poc_verifier.confidence.nvd.prefetch(nvd_cves)
+        except Exception:
+            pass
         scan_data = {
             "main": {
                 "target": target, "domain": domain, "ip": ip,
@@ -2838,6 +3198,7 @@ def main():
             "nuclei_findings": nuclei_results or []
         }
         poc_results = poc_verifier.verify_all(scan_data)
+        save_stage("poc", {"poc_results": poc_results})
     else:
         log_warning("[PoC] Skipped")
 
@@ -2878,6 +3239,11 @@ def main():
         with open(json_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False, default=str)
         log_success(f"[Save] JSON: {json_file}")
+
+    # HTML-отчёт с сортировкой PoC-проверок по confidence
+    if args.format_html or args.format in ("all", "json", "csv"):
+        html_file = f"{args.output_dir}/recon_{target}_{timestamp}.html"
+        generate_html_report(results, poc_results, html_file)
 
     if save_csv:
         csv_file = f"{args.output_dir}/recon_{target}_{timestamp}.csv"
@@ -2924,6 +3290,8 @@ def main():
         s = poc_results["summary"]
         print(f"  {Colors.OKGREEN}PoC Summary: {s['vulnerable']}V/{s['not_vulnerable']}NV/{s['unknown']}U/{s['error']}E/{s['blocked']}B/{s['skipped']}S (total {s['total']}){Colors.ENDC}")
     print()
+    # Скан завершён полностью — промежуточный state больше не нужен
+    clear_resume_state(args.output_dir, target)
 
 if __name__ == "__main__":
     main()

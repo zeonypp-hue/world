@@ -116,6 +116,90 @@ def test_confidence_engine_version_mismatch_penalized():
     assert "Version outside vulnerable range" in out_of_range["reason"]
 
 
+def test_nvd_ranges_client_parse_and_cache():
+    client = rt.NVDRangesClient()
+    client.cache_file = "/tmp/recon_test_nvd.json"
+    if os.path.exists(client.cache_file):
+        os.remove(client.cache_file)
+    client._load()
+    nvd_body = {"vulnerabilities": [{"cve": {"id": "CVE-2024-12345", "configurations": [
+        {"nodes": [{"cpeMatch": [
+            {"criteria": "cpe:2.3:a:apache:httpd:2.4.49:*:*:*:*:*:*:*",
+             "versionStartIncluding": "2.4.49", "versionEndIncluding": "2.4.50"}
+        ]}]}
+    ]}}]}
+    calls = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(params["cveId"])
+        return FakeResponse(200, body=nvd_body)
+
+    client.session = types.SimpleNamespace(get=fake_get)
+    ranges = client.get_ranges("CVE-2024-12345")
+    assert ranges and ranges[0]["min"] == "2.4.49"
+    assert ranges[0]["max"] == "2.4.50"
+    # Повторный вызов идёт из кэша — без сети
+    assert client.get_ranges("CVE-2024-12345") == ranges
+    assert len(calls) == 1
+    # Кэш сохранён на диск и перечитывается
+    client2 = rt.NVDRangesClient()
+    client2.cache_file = "/tmp/recon_test_nvd.json"
+    client2._load()
+    assert client2.get_ranges("CVE-2024-12345") == ranges
+    os.remove("/tmp/recon_test_nvd.json")
+
+
+def test_msf_checkcode_parsing():
+    v = rt.PoCVerifier()
+    assert v._parse_msf_check_output("CheckCode::Vulnerable (The target is exploitable)") == \
+        ("vulnerable", "CheckCode::Vulnerable (target is exploitable)")
+    assert v._parse_msf_check_output("CheckCode::Safe (No vulnerabilities found)")[0] == "not_vulnerable"
+    assert v._parse_msf_check_output("CheckCode::Unknown")[0] == "unknown"
+    # Строки без CheckCode падают в старые текстовые паттерны
+    assert v._parse_msf_check_output("The target is vulnerable.")[0] == "vulnerable"
+
+
+def test_nuclei_check_cve_no_nuclei():
+    scanner = rt.NucleiScanner()
+    # nuclei не установлен в песочнице — должен вернуть None, не падать
+    if not rt.is_tool_installed("nuclei"):
+        assert scanner.check_cve("http://example.com", "CVE-2021-44228") is None
+
+
+def test_resume_state_roundtrip():
+    os.makedirs("/tmp/recon_test_out", exist_ok=True)
+    rt.save_resume_state("/tmp/recon_test_out", "example.com", "nmap",
+                          {"ports": [80, 443]}, None)
+    state = rt.load_resume_state("/tmp/recon_test_out", "example.com")
+    assert state["stage"] == "nmap"
+    assert state["results"]["ports"] == [80, 443]
+    rt.clear_resume_state("/tmp/recon_test_out", "example.com")
+    assert rt.load_resume_state("/tmp/recon_test_out", "example.com") is None
+
+
+def test_html_report_generation():
+    os.makedirs("/tmp/recon_test_out", exist_ok=True)
+    results = {"target": "example.com", "ip": "1.2.3.4", "timestamp": "20260929",
+               "os": {"name": "Linux"}, "detailed_ports": [
+                   {"port": 80, "protocol": "tcp", "service": {"name": "http", "product": "nginx",
+                                                               "version": "1.18", "banner": ""}}],
+               "subdomains": ["www.example.com"]}
+    poc_results = {"main": [
+        {"vulnerability": "CVE-2021-41773", "target": "example.com", "status": "vulnerable",
+         "confidence": 95, "epss": 0.9, "kev": True, "details": "Read /etc/passwd"},
+        {"vulnerability": "CVE-2014-0160", "target": "example.com", "status": "not_vulnerable",
+         "confidence": 40, "epss": 0.1, "kev": False, "details": "no leak"},
+    ], "subdomains": {}, "hard_mode_subdomains": {}, "summary": {}}
+    out = "/tmp/recon_test_out/report.html"
+    rt.generate_html_report(results, poc_results, out)
+    with open(out, encoding="utf-8") as f:
+        html = f.read()
+    assert "CVE-2021-41773" in html and "example.com" in html and "nginx" in html
+    # Сортировка: high-confidence CVE идёт раньше low-confidence
+    assert html.index("CVE-2021-41773") < html.index("CVE-2014-0160")
+    assert "<script" not in html  # только статичный HTML, без скриптов
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
