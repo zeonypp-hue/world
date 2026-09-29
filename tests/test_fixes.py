@@ -200,6 +200,87 @@ def test_html_report_generation():
     assert "<script" not in html  # только статичный HTML, без скриптов
 
 
+def test_rce_differential_not_string_match():
+    v = rt.PoCVerifier()
+    class Resp:
+        def __init__(self, text, status_code=200):
+            self.text = text
+            self.status_code = status_code
+    # Страница содержит слово "root" в тексте — без дифференциальной
+    # проверки это давало ложное "vulnerable"
+    def fake_safe(method, url, **kw):
+        if "cmd=id" in url:
+            return Resp("<html>Site about root vegetables</html>"), None
+        if "exec=whoami" in url:
+            return Resp("<html>Site about root vegetables</html>"), None
+        return Resp("<html>Site about root vegetables</html>"), None
+    v._safe_request = fake_safe
+    assert v.check_rce("http://example.com") is None
+
+    # Реальный вывод id только с параметром — срабатывание
+    def fake_safe2(method, url, **kw):
+        if "cmd=id" in url:
+            return Resp("uid=33(www-data) gid=33(www-data) groups=33"), None
+        return Resp("<html>normal page</html>"), None
+    v._safe_request = fake_safe2
+    res = v.check_rce("http://example.com")
+    assert res and res["status"] == "vulnerable"
+
+    # Ложный случай: uid= есть уже в baseline (отражается всегда)
+    def fake_safe3(method, url, **kw):
+        return Resp("uid=0(root) hardcoded footer"), None
+    v._safe_request = fake_safe3
+    assert v.check_rce("http://example.com") is None
+
+
+def test_high_epss_escalation():
+    class FakeVulners:
+        def normalize_cpe(self, cpe):
+            return ("", "", "")
+
+    class FakeEpss:
+        def __init__(self, epss, kev):
+            self.epss, self.kev = epss, kev
+
+        def get_priority_score(self, cve):
+            return self.epss, self.kev, self.epss + (0.5 if self.kev else 0)
+
+    engine = rt.ConfidenceEngine(FakeVulners(), FakeEpss(0.97, False))
+    # ProFTPD без версии (как в реальном скане): раньше 15-17 -> skip
+    conf = engine.score({"product": "ProFTPD", "version": "", "banner": "", "cpe": ""},
+                        "CVE-2015-3306", "searchsploit")
+    assert conf["score"] >= 55, conf
+    assert conf["action"] in ("run_check", "run_poc")
+    assert "Escalated" in conf["reason"]
+
+    # Низкий EPSS без версии — как и раньше skip
+    engine2 = rt.ConfidenceEngine(FakeVulners(), FakeEpss(0.05, False))
+    conf2 = engine2.score({"product": "ProFTPD", "version": "", "banner": "", "cpe": ""},
+                          "CVE-2015-3306", "searchsploit")
+    assert conf2["action"] == "skip"
+
+
+def test_php_cgi_check():
+    v = rt.PoCVerifier()
+    class Resp:
+        def __init__(self, text, status_code=200):
+            self.text = text
+            self.status_code = status_code
+
+    def fake_safe(method, url, data=None, headers=None, **kw):
+        # ответ не содержит маркер из payload
+        return Resp("<html>nothing</html>"), None
+    v._safe_request = fake_safe
+    res = v.check_php_cgi_cve_2012_1823("http://example.com")
+    assert res["status"] == "not_vulnerable"
+
+    def fake_safe2(method, url, data=None, headers=None, **kw):
+        return Resp("output: " + data.replace("<?php echo '", "").replace("'; ?>", "")), None
+    v._safe_request = fake_safe2
+    res2 = v.check_php_cgi_cve_2012_1823("http://example.com")
+    assert res2["status"] == "vulnerable"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
