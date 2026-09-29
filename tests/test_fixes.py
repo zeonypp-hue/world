@@ -281,6 +281,108 @@ def test_php_cgi_check():
     assert res2["status"] == "vulnerable"
 
 
+def test_sqli_differential():
+    v = rt.PoCVerifier()
+    class Resp:
+        def __init__(self, text):
+            self.text = text
+
+    # Ошибка MySQL только с payload — vulnerable
+    def fake(method, url, **kw):
+        if "id=1'" in url:
+            return Resp("Warning: mysqli_query(): SQL syntax error near"), None
+        return Resp("<html>ok page</html>"), None
+    v._safe_request = fake
+    res = v.check_sqli("http://example.com")
+    assert res and res["status"] == "vulnerable", res
+
+    # Ошибка присутствует и в baseline — не срабатывает
+    def fake2(method, url, **kw):
+        return Resp("Warning: mysqli_query(): error page footer"), None
+    v._safe_request = fake2
+    assert v.check_sqli("http://example.com") is None
+
+    # Чистый сайт — None
+    def fake3(method, url, **kw):
+        return Resp("<html>ok page</html>"), None
+    v._safe_request = fake3
+    assert v.check_sqli("http://example.com") is None
+
+
+def test_sqlmap_output_parse():
+    scanner = rt.SQLMapScanner("/tmp")
+    scanner.available = True  # в песочнице sqlmap нет, тестируем только парсер
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return types.SimpleNamespace(stdout="back-end DBMS: MySQL >= 5.0\nParameter 'id' is vulnerable", stderr="", returncode=0)
+
+    import recon_tool as r2
+    orig_run = r2.subprocess.run
+    r2.subprocess.run = fake_run
+    try:
+        res = scanner.scan("http://example.com/item.php?id=1")
+    finally:
+        r2.subprocess.run = orig_run
+    assert res["status"] == "vulnerable"
+    assert "MySQL" in res["details"]
+
+    def fake_run2(cmd, **kw):
+        return types.SimpleNamespace(stdout="all tested parameters do not appear to be injectable", stderr="", returncode=0)
+    r2.subprocess.run = fake_run2
+    try:
+        res2 = scanner.scan("http://example.com/item.php?id=1")
+    finally:
+        r2.subprocess.run = orig_run
+    assert res2["status"] == "not_vulnerable"
+
+
+def test_mysql_fingerprint_parse():
+    # Поддельный handshake: длина, seq, protocol, версия, \x00
+    payload = bytes([10]) + b"8.0.32-0ubuntu" + b"\x00" + b"\x00" * 40
+    data = len(payload).to_bytes(3, "little") + b"\x00" + payload
+
+    class FakeSock:
+        def __init__(self, data): self._d = data
+        def recv(self, n): return self._d
+        def close(self): pass
+
+    orig = rt.socket.create_connection
+    rt.socket.create_connection = lambda addr, timeout=None: FakeSock(data)
+    try:
+        ver = rt.mysql_fingerprint("1.2.3.4", 3306)
+    finally:
+        rt.socket.create_connection = orig
+    assert ver == "8.0.32-0ubuntu", ver
+
+
+def test_wp_fingerprint_version():
+    scanner = rt.WordPressScanner()
+    html = '<meta name="generator" content="WordPress 6.2.1"> <link href="/wp-content/plugins/contact-form-7/includes/css/styles.css">'
+
+    class Resp:
+        text = html
+
+    import recon_tool as r2
+    class FakeSess:
+        headers = {}
+
+        def get(self, url, **kw):
+            if url.rstrip("/").endswith("/feed/") or "readme" in url:
+                raise Exception("skip")
+            return Resp()
+
+    orig_session = r2.requests.Session
+    r2.requests.Session = lambda: FakeSess()
+    try:
+        info = scanner.detect("http://example.com")
+    finally:
+        r2.requests.Session = orig_session
+    assert info["version"] == "6.2.1"
+    assert "contact-form-7" in info["plugins"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -1454,6 +1454,158 @@ class FaviconExtractor:
         return None
 
 
+class WordPressScanner:
+    """WordPress fingerprinting: версия, тема, активные плагины.
+    wpscan (если установлен) используется для полного перечисления."""
+
+    COMMON_PLUGINS = [
+        "contact-form-7", "elementor", "wpforms-lite", "woocommerce", "yoast",
+        "akismet", "wordfence", "all-in-one-seo-pack", "jetpack", "wp-super-cache",
+        "litespeed-cache", "really-simple-ssl", "duplicator", "file-manager",
+        "responsive-lightbox", "loginizer", "google-site-kit", "redirection",
+        "updraftplus", "wp-file-manager", "simple-file-list", "yellow-pencil-visual-theme-customizer",
+    ]
+
+    def detect(self, url, timeout=20):
+        """Пассивный fingerprint: версия из feed/readme/meta, плагины по следам."""
+        sess = requests.Session()
+        sess.verify = False
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
+        result = {"url": url, "version": None, "theme": None, "plugins": []}
+        # 1. Версия из meta generator на главной
+        try:
+            r = sess.get(url, timeout=timeout)
+            m = re.search(r'name="generator"\s+content="WordPress\s+([\d.]+)', r.text, re.I)
+            if m:
+                result["version"] = m.group(1)
+            m = re.search(r'/wp-content/themes/([a-z0-9\-_]+)/', r.text, re.I)
+            if m:
+                result["theme"] = m.group(1)
+            for p in re.findall(r'/wp-content/plugins/([a-z0-9\-_]+)/', r.text, re.I):
+                if p not in result["plugins"]:
+                    result["plugins"].append(p)
+        except Exception:
+            pass
+        # 2. feed/readme
+        if not result["version"]:
+            for path, pat in [("/feed/", r"<generator>https://wordpress.org/\?v=([\d.]+)</generator>"),
+                              ("/readme.html", r"Version\s+([\d.]+)")]:
+                try:
+                    r = sess.get(urljoin(url + "/", path.lstrip("/")), timeout=timeout)
+                    m = re.search(pat, r.text)
+                    if m:
+                        result["version"] = m.group(1)
+                        break
+                except Exception:
+                    continue
+        # 3. Вероятные плагины по HTTP-следам (200 = есть)
+        def probe(p):
+            try:
+                r = sess.get(urljoin(url + "/", f"wp-content/plugins/{p}/"), timeout=8, allow_redirects=False)
+                return p if r.status_code in (200, 301, 403) else None
+            except Exception:
+                return None
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            for fut in as_completed([ex.submit(probe, p) for p in self.COMMON_PLUGINS]):
+                p = fut.result()
+                if p and p not in result["plugins"]:
+                    result["plugins"].append(p)
+        return result
+
+    def wpscan(self, url, timeout=900):
+        """Полное перечисление через wpscan (Kali: apt install wpscan)."""
+        if not is_tool_installed("wpscan"):
+            log_warning("[WP] wpscan не установлен (apt install wpscan) — только пассивный fingerprint")
+            return None
+        out_file = f"/tmp/wpscan_{int(time.time())}.json"
+        cmd = ["wpscan", "--url", url, "--no-banner", "--no-update",
+               "--enumerate", "vp,vt,cb,dbe,u", "--format", "json", "-o", out_file]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                               env={**os.environ, "TERM": "dumb"})
+            if os.path.exists(out_file):
+                with open(out_file) as f:
+                    data = json.load(f)
+                os.remove(out_file)
+                interesting = data.get("interesting_findings", [])
+                ver = (data.get("version") or {}).get("number")
+                if ver:
+                    log_success(f"[WP] wpscan: WordPress {ver} ({len(interesting)} findings)")
+                return data
+            log_warning(f"[WP] wpscan без результата (code {r.returncode}); "
+                        "без API-токена wpscan не показывает уязвимости плагинов — "
+                        "--wp-token / WPSCAN_API_TOKEN")
+            return None
+        except Exception as e:
+            log_warning(f"[WP] wpscan err: {e}")
+            return None
+
+
+def mysql_fingerprint(ip, port=3306, timeout=6):
+    """Версия MySQL из handshake-пакета (сервер посылает её первым)."""
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+        data = s.recv(128)
+        s.close()
+        # Протокол handshake MySQL/MariaDB = 9 или 10
+        if len(data) > 5 and data[4] in (9, 10):
+            end = data.find(b"\x00", 5)
+            version = data[5:end].decode("utf-8", "ignore")
+            if re.match(r"^\d+\.\d+\.\d+", version):
+                return version
+    except Exception:
+        pass
+    return None
+
+
+class SQLMapScanner:
+    """sqlmap для подтверждения SQLi. По умолчанию выключен: включается
+    флагом --sqlmap. Консервативные настройки: --batch --level=1 --risk=1."""
+
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+        self.available = is_tool_installed("sqlmap")
+        if not self.available:
+            log_warning("[SQLMap] не установлен (apt install sqlmap) — "
+                        "только встроенная дифференциальная проверка")
+
+    def scan(self, url, timeout=300):
+        if not self.available:
+            return None
+        try:
+            cmd = ["sqlmap", "-u", url, "--batch", "--level=1", "--risk=1",
+                   "--random-agent", "--threads=5", "--timeout=15", "--retries=2",
+                   "--answers=" + quote("follow=N,redirect=N"),
+                   "--output-dir", self.output_dir, "--disable-coloring"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                               env={**os.environ, "TERM": "dumb"})
+            out = strip_ansi(r.stdout + "\n" + r.stderr)
+            is_vuln = "is vulnerable" in out.lower()
+            not_vuln = "does not seem to be" in out.lower() or "all tested parameters do not appear" in out.lower()
+            dbms_m = re.search(r"back-end DBMS:\s*(.+)", out)
+            if is_vuln:
+                return {"target": url, "vulnerability": "SQL Injection", "type": "generic",
+                        "status": "vulnerable",
+                        "details": f"sqlmap confirmed ({dbms_m.group(1).strip() if dbms_m else 'dbms unknown'})",
+                        "method": "sqlmap", "timestamp": datetime.now().isoformat()}
+            if not_vuln:
+                return {"target": url, "vulnerability": "SQL Injection", "type": "generic",
+                        "status": "not_vulnerable", "details": "sqlmap: parameters do not appear injectable",
+                        "method": "sqlmap", "timestamp": datetime.now().isoformat()}
+            return {"target": url, "vulnerability": "SQL Injection", "type": "generic",
+                    "status": "unknown", "details": "sqlmap: no clear result",
+                    "method": "sqlmap", "timestamp": datetime.now().isoformat()}
+        except subprocess.TimeoutExpired:
+            return {"target": url, "vulnerability": "SQL Injection", "type": "generic",
+                    "status": "error", "details": f"sqlmap timeout ({timeout}s)",
+                    "method": "sqlmap", "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            return {"target": url, "vulnerability": "SQL Injection", "type": "generic",
+                    "status": "error", "details": str(e), "method": "sqlmap",
+                    "timestamp": datetime.now().isoformat()}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DOMAIN RESOLVER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1950,6 +2102,7 @@ class PoCVerifier:
         self.github = github_finder or GitHubPoCFinder()
         self.confidence = ConfidenceEngine(self.vulners, self.epss_kev)
         self._nuclei = NucleiScanner()
+        self.aggressive = False
         self.waf_signatures = {
             "cloudflare": ["cloudflare", "cf-ray", "cf-cache-status"],
             "modsecurity": ["mod_security", "modsecurity", "406 not acceptable"],
@@ -2060,6 +2213,7 @@ class PoCVerifier:
             host = target or ip
             service_info = self._get_service_info(ports, port)
             conf = self.confidence.score(service_info, cve, "vulners")
+            conf = self._maybe_escalate(conf)
             if conf["action"] == "skip":
                 checks.append({"target": target or ip, "vulnerability": cve, "type": "vulners_cpe",
                     "status": "skipped", "details": f"Confidence {conf['score']}/100 -- {conf['reason']}",
@@ -2194,6 +2348,7 @@ class PoCVerifier:
             service_info = {"product": svc.get("product", ""), "version": version, "banner": ""}
             for cve in product_cves:
                 conf = self.confidence.score(service_info, cve, "generic")
+                conf = self._maybe_escalate(conf)
                 if conf["action"] == "skip":
                     checks.append({"target": host, "vulnerability": cve, "type": "product_mapping",
                         "status": "skipped", "details": f"Confidence {conf['score']}/100 -- {conf['reason']}",
@@ -2220,9 +2375,31 @@ class PoCVerifier:
                             result = check_method(url)
                             if result:
                                 result["target"] = target or ip; result["port"] = port_num; result["label"] = label; result["confidence"] = 30
-                                checks.append(result); seen_generics.add(check_name)
+                            checks.append(result); seen_generics.add(check_name)
                         except Exception: pass
+            # TLS-порты почты и прочего: Heartbleed проверяется по каждому
+            # TLS-порту, а не только на 443
+            if port_num in (465, 993, 995, 9443) and port_num not in seen_generics:
+                seen_generics.add(port_num)
+                hb_host = target if target else ip
+                scheme2 = "https"
+                hb_url = f"{scheme2}://{hb_host}:{port_num}"
+                res = self.check_heartbleed(hb_url, {"port": port_num})
+                if res:
+                    res["label"] = label; res["confidence"] = 55
+                    checks.append(res)
         return checks
+
+    def _maybe_escalate(self, conf):
+        """--aggressive: всё с confidence >= 40 уходит на безопасную проверку
+        (msf check / nuclei), даже без EPSS/KEV-эскалации."""
+        if self.aggressive and conf.get("score", 0) >= 40 and conf.get("action") in ("skip", "info_only"):
+            conf = dict(conf)
+            conf["score"] = max(conf["score"], 55)
+            conf["action"] = "run_check"
+            conf["level"] = "MEDIUM"
+            conf["reason"] += " | --aggressive: escalated to safe check"
+        return conf
 
     def _get_service_info(self, ports, port_num):
         if not port_num: return {"product": "", "version": "", "banner": "", "cpe": ""}
@@ -2266,9 +2443,12 @@ class PoCVerifier:
         web_result = self._check_cve_by_id(url, cve, context)
         if web_result:
             web_result["label"] = label; results.append(web_result)
-        # Fallback: встроенного check нет (или он unknown) и метаплоты
-        # не дали результата — пробуем nuclei-шаблон этого CVE.
-        if conf.get("score", 0) >= 40 and (not web_result or web_result.get("status") == "unknown") and not results:
+        # Fallback: встроенного check нет (или он unknown) и никакого
+        # определённого ответа ещё нет — пробуем nuclei-шаблон этого CVE.
+        # (msf "Check failed/cannot determine" = unknown тоже считается
+        # отсутствием определённого ответа.)
+        definitive = any(r.get("status") in ("vulnerable", "not_vulnerable", "blocked") for r in results)
+        if conf.get("score", 0) >= 40 and (not web_result or web_result.get("status") == "unknown") and not definitive:
             nuclei_res = self._nuclei.check_cve(url, cve)
             if nuclei_res:
                 nuclei_res["label"] = label
@@ -2865,15 +3045,39 @@ class PoCVerifier:
                 "details": f"Response: {r.status_code if r else 'error'}", "method": "grafana_path_traversal", "timestamp": datetime.now().isoformat()}
 
     def check_sqli(self, url):
-        test_urls = [f"{url}?id=1'", f"{url}?id=1 AND 1=1", f"{url}?id=1 AND 1=2"]
-        for test_url in test_urls:
-            r, err = self._safe_request("get", test_url)
-            if err and "blocked" in err:
-                return {"target": url, "vulnerability": "SQL Injection", "type": "generic", "status": "blocked",
-                    "details": f"WAF blocked ({err})", "method": "sqli_test", "timestamp": datetime.now().isoformat()}
-            if r and any(x in r.text.lower() for x in ["sql syntax", "mysql_fetch", "ora-", "postgresql", "sqlite"]):
+        # Дифференциальная: ошибка СУБД должна появиться только с payload
+        # (бенчмарк-пары AND 1=1 / AND 1=2 с разным ответом = инъекция).
+        sql_error_patterns = [
+            re.compile(r"SQL syntax.*?MySQL|MySQLSyntaxErrorException", re.I),
+            re.compile(r"Warning:\s*mysql_|mysqli?_", re.I),
+            re.compile(r"ORA-\d{4,5}:", re.I),
+            re.compile(r"PostgreSQL.*?ERROR|pg_query\(\)", re.I),
+            re.compile(r"SQLite/JDBCDriverException|sqlite3\.OperationalError", re.I),
+            re.compile(r"Microsoft OLE DB Provider for SQL Server|Unclosed quotation mark", re.I),
+        ]
+        baseline, _ = self._safe_request("get", url)
+        baseline_text = (baseline.text or "") if baseline is not None else ""
+        base_len = len(baseline_text)
+        r_err, err = self._safe_request("get", f"{url}?id=1'")
+        if err and "blocked" in err:
+            return {"target": url, "vulnerability": "SQL Injection", "type": "generic", "status": "blocked",
+                "details": f"WAF blocked ({err})", "method": "sqli_test", "timestamp": datetime.now().isoformat()}
+        if r_err is not None:
+            for pat in sql_error_patterns:
+                if pat.search(r_err.text) and not pat.search(baseline_text):
+                    return {"target": url, "vulnerability": "SQL Injection", "type": "generic", "status": "vulnerable",
+                        "details": f"SQL error only with payload ({pat.pattern[:40]})",
+                        "method": "sqli_test", "timestamp": datetime.now().isoformat()}
+        # Boolean-based: разные размеры ответа при true/false
+        r_t, _ = self._safe_request("get", f"{url}?id=1 AND 1=1")
+        r_f, _ = self._safe_request("get", f"{url}?id=1 AND 1=2")
+        if r_t is not None and r_f is not None:
+            lt, lf = len(r_t.text), len(r_f.text)
+            # разница > 50 байт между true/false при стабильном baseline
+            if abs(lt - lf) > 50 and abs(base_len - lt) < abs(lt - lf):
                 return {"target": url, "vulnerability": "SQL Injection", "type": "generic", "status": "vulnerable",
-                    "details": f"SQL error detected in response", "method": "sqli_test", "timestamp": datetime.now().isoformat()}
+                    "details": f"Boolean-based differential: true={lt}B, false={lf}B",
+                    "method": "sqli_test", "timestamp": datetime.now().isoformat()}
         return None
 
     def check_xss(self, url):
@@ -2964,6 +3168,10 @@ def main():
     parser.add_argument("--dir-timeout", type=int, default=900, help="Directory brute force timeout (seconds)")
     parser.add_argument("--resume", action="store_true", help="Resume from saved state (.resume_state_TARGET.json)")
     parser.add_argument("--nvd-api-key", default=os.environ.get("NVD_API_KEY"), help="NVD API key (range checks)")
+    parser.add_argument("--sqlmap", action="store_true", help="Confirm SQLi with sqlmap (active scanning)")
+    parser.add_argument("--aggressive", action="store_true", help="Check everything with confidence >= 40 (safe checks)")
+    parser.add_argument("--wp-token", default=os.environ.get("WPSCAN_API_TOKEN"), help="WPScan API token (plugin vulns)")
+    parser.add_argument("--skip-wp", action="store_true", help="Skip WordPress fingerprinting")
     args = parser.parse_args()
 
     if args.no_color:
@@ -3006,6 +3214,8 @@ def main():
     github_finder = GitHubPoCFinder(token=args.github_token)
     poc_verifier = PoCVerifier(vulners_engine, epss_kev, github_finder)
     poc_verifier.confidence.nvd = NVDRangesClient(api_key=args.nvd_api_key)
+    poc_verifier.aggressive = bool(args.aggressive)
+    sqlmap_scanner = SQLMapScanner(args.output_dir)
 
     def save_stage(stage, payload):
         save_resume_state(args.output_dir, target, stage, payload, args)
@@ -3039,6 +3249,7 @@ def main():
     log_section("BANNER GRAB")
     key_ports = [21, 22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 3306, 5432, 6379, 8080, 8443, 9000, 9200, 27017]
     banners = banner_grab_ports(ip, key_ports)
+
 
     # Fallback wordlists: не падаем, если дефолтного файла нет
     wordlist = find_first_existing([
@@ -3082,6 +3293,21 @@ def main():
     if nmap_os:
         log_success(f"[Nmap OS] {nmap_os['name']} (accuracy: {nmap_os['accuracy']})")
         os_info = nmap_os
+
+    # MySQL handshake: точная версия сервера из greeting-пакета
+    if 3306 in open_ports:
+        mysql_ver = mysql_fingerprint(ip, 3306)
+        if mysql_ver:
+            log_success(f"[MySQL] Handshake version: {mysql_ver}")
+            for p in detailed_ports:
+                if str(p.get("port")) == "3306":
+                    svc = p.setdefault("service", {})
+                    if not svc.get("version"):
+                        svc["product"] = "MySQL"; svc["version"] = mysql_ver
+                    banners[3306] = {"raw": f"MySQL {mysql_ver}", "product": "MySQL",
+                                     "version": mysql_ver, "clean": f"MySQL {mysql_ver}"}
+        else:
+            log_info("[MySQL] Handshake not readable (прокси/защита?)")
 
     # Merge banner data into detailed ports
     for p in detailed_ports:
@@ -3157,6 +3383,25 @@ def main():
         results = cors_checker.check(url)
         if results:
             cors_results[url] = results
+
+    # WordPress fingerprint + wpscan
+    wp_results = {}
+    if not args.skip_wp:
+        log_section("WORDPRESS CHECK")
+        wp_scanner = WordPressScanner()
+        for url in urls_to_scan[:2]:
+            wp_info = wp_scanner.detect(url)
+            is_wp = bool(wp_info.get("version") or wp_info.get("theme") or
+                         any("wp-" in l.get("path", "") for l in (leak_results.get(url) or [])))
+            if is_wp:
+                log_success(f"[WP] WordPress detected: version={wp_info.get('version')}, "
+                            f"theme={wp_info.get('theme')}, plugins={wp_info.get('plugins')}")
+                wp_data = wp_scanner.wpscan(url)
+                if wp_data and args.wp_token:
+                    pass  # полные данные wpscan уходят в JSON целиком
+                wp_results[url] = {"fingerprint": wp_info, "wpscan": wp_data}
+        if not wp_results:
+            log_info("[WP] WordPress not detected")
 
     # SSL
     log_section("SSL/TLS SCAN")
@@ -3267,6 +3512,20 @@ def main():
     else:
         log_warning("[PoC] Skipped")
 
+    # sqlmap: подтверждение SQLi (только при --sqlmap)
+    sqlmap_results = None
+    if args.sqlmap and sqlmap_scanner.available:
+        log_section("SQLMAP CONFIRMATION")
+        sqlmap_results = []
+        for url in urls_to_scan[:2]:
+            log_info(f"[SQLMap] {url}")
+            res = sqlmap_scanner.scan(url)
+            if res:
+                res["label"] = "sqlmap"
+                if res["status"] == "vulnerable":
+                    log_success(f"[SQLMap] {url}: VULNERABLE — {res['details']}")
+                sqlmap_results.append(res)
+
     # Save results
     log_section("SAVING RESULTS")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3287,6 +3546,7 @@ def main():
         "directories": dir_results,
         "leaks": leak_results,
         "cors": cors_results,
+        "wordpress": wp_results,
         "ssl": ssl_results,
         "favicons": favicon_results,
         "nuclei": nuclei_results,
@@ -3295,6 +3555,8 @@ def main():
         "hard_mode_subdomains": hard_mode_subdomains,
         "poc_results": poc_results
     }
+    if sqlmap_results is not None:
+        results["sqlmap"] = sqlmap_results
 
     save_json = args.format in ("json", "all")
     save_csv = args.format in ("csv", "all")
