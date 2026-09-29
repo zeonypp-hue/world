@@ -2170,6 +2170,7 @@ class PoCVerifier:
         for sub_checks in results["subdomains"].values(): all_checks.extend(sub_checks)
         for sub_checks in results["hard_mode_subdomains"].values(): all_checks.extend(sub_checks)
         results["summary"]["total"] = len(all_checks)
+        all_checks = [c for c in all_checks if isinstance(c, dict)]
         for c in all_checks:
             s = c.get("status", "unknown")
             if s in results["summary"]: results["summary"][s] += 1
@@ -2375,7 +2376,8 @@ class PoCVerifier:
                             result = check_method(url)
                             if result:
                                 result["target"] = target or ip; result["port"] = port_num; result["label"] = label; result["confidence"] = 30
-                            checks.append(result); seen_generics.add(check_name)
+                                checks.append(result)
+                            seen_generics.add(check_name)
                         except Exception: pass
             # TLS-порты почты и прочего: Heartbleed проверяется по каждому
             # TLS-порту, а не только на 443
@@ -2433,7 +2435,9 @@ class PoCVerifier:
         if self._msf_available and conf.get("score", 0) >= 55:
             msf_modules = self._search_metasploit_by_cve(cve)
             if msf_modules:
-                log_info(f"[PoC] MSF found {len(msf_modules)} modules for {cve} (conf={conf.get('score')})")
+                checked = [m for m in msf_modules if m.get("check") == "Yes"]
+                if checked:
+                    log_info(f"[PoC] MSF {cve}: {len(checked)} module(s) with safe check")
                 for mod in msf_modules:
                     if mod.get("check") == "Yes":
                         res = self._run_metasploit_check(host, host, port, mod, label)
