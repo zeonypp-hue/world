@@ -3400,9 +3400,12 @@ def main():
             if is_wp:
                 log_success(f"[WP] WordPress detected: version={wp_info.get('version')}, "
                             f"theme={wp_info.get('theme')}, plugins={wp_info.get('plugins')}")
-                wp_data = wp_scanner.wpscan(url)
-                if wp_data and args.wp_token:
-                    pass  # полные данные wpscan уходят в JSON целиком
+                # Без токена wpscan не показывает уязвимости плагинов/тем —
+                # не тратим ~5 минут на пустой запуск.
+                wp_data = wp_scanner.wpscan(url) if args.wp_token else None
+                if not args.wp_token:
+                    log_info("[WP] wpscan пропущен: нет --wp-token (версии плагинов "
+                             "и их CVE показывает только wpscan с API-токеном)")
                 wp_results[url] = {"fingerprint": wp_info, "wpscan": wp_data}
         if not wp_results:
             log_info("[WP] WordPress not detected")
