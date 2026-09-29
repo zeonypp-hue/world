@@ -2905,7 +2905,7 @@ class PoCVerifier:
         # а не слово "root" в обычной странице.
         baseline, _ = self._safe_request("get", url)
         baseline_text = (baseline.text or "") if baseline is not None else ""
-        id_re = re.compile(r"uid=\d+\([a-z_][\w]*\)\s+gid=\d+\([a-z_][\w]*\)")
+        id_re = re.compile(r"uid=\d+\([a-z_][\w-]*\)\s+gid=\d+\([a-z_][\w-]*\)")
         whoami_re = re.compile(r"^[\w.-]*(www-data|apache2?|nginx|daemon|nobody)[\w.-]*$", re.MULTILINE)
         for param, payload, marker_re, marker_desc in [
             ("cmd", "id", id_re, "uid/gid output"),
