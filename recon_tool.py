@@ -38,6 +38,7 @@ import random
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import threading
 from urllib.parse import urljoin, quote
 
 import urllib3
@@ -267,6 +268,30 @@ def os_guess_by_ttl(ip):
 
 def is_ip(t):
     return bool(re.match(r"^(\d{1,3}\.){3}\d{1,3}$", t))
+
+
+class RateLimiter:
+    """Глобальный ограничитель запросов (RPS): не даёт пакетному режиму
+    задушить сеть. Потокобезопасен."""
+
+    def __init__(self, rps=None):
+        self.min_interval = (1.0 / rps) if rps else 0.0
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self):
+        if not self.min_interval:
+            return
+        with self._lock:
+            now = time.monotonic()
+            next_slot = max(now, self._last + self.min_interval)
+            self._last = next_slot
+        sleep_for = next_slot - time.monotonic()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
+RATE_LIMITER = RateLimiter()  # глобальный: включается --rate-limit
 
 
 def find_first_existing(paths):
@@ -1322,8 +1347,9 @@ class NmapScanner:
         log_info(f"[Nmap] Detailed: {len(ports)} ports on {target}")
         ps = ",".join(map(str, ports))
         cmd = [
-            "nmap", "-sC", "-sV", "--version-all", "-p", ps, "-A", "--reason",
-            "--script", "vuln,vulners", f"-{self.timing}", "--max-retries", "3", "-oX", "-", target
+            # --version-all даёт десятки проб на порт; intensity 5 = те же CPE в разы быстрее
+            "nmap", "-sC", "-sV", "--version-intensity", "5", "-p", ps, "-A", "--reason",
+            "--script", "vulners", f"-{self.timing}", "--max-retries", "2", "-oX", "-", target
         ]
         if self.is_root:
             cmd[1:1] = ["-O", "--osscan-guess", "-f"]
@@ -1437,6 +1463,8 @@ class DirectoryScanner:
             "gobuster", "dir", "-u", url, "-w", self.wordlist,
             "-t", str(self.threads), "-o", out, "-k", "--no-error", "-e"
         ]
+        # адаптивная задержка: медленные цели не душатся 50 потоками
+        cmd += ["-d", "0.1s", "--timeout", "15s"]
         results = []
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -2926,6 +2954,7 @@ class PoCVerifier:
 
     def _safe_request(self, method, url, **kwargs):
         try:
+            RATE_LIMITER.wait()
             if method == "get": r = self.session.get(url, timeout=self.timeout, allow_redirects=False, **kwargs)
             elif method == "post": r = self.session.post(url, timeout=self.timeout, allow_redirects=False, **kwargs)
             else: r = self.session.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
@@ -3412,6 +3441,8 @@ def build_arg_parser():
                         help="Confidence threshold (0-100) for useful-finding notifications (default 70)")
     parser.add_argument("--batch-threads", type=int, default=1,
                         help="Parallel scans in batch mode (1-5, default 1)")
+    parser.add_argument("--rate-limit", type=int, default=None,
+                        help="Max HTTP requests/sec (global, all scans). Default: no limit")
     return parser
 
 
@@ -3926,6 +3957,12 @@ def main():
     notifier = TelegramNotifier(args.notify)
     if args.notify and not notifier.enabled:
         log_warning("[TG] --notify без BOT_TOKEN:CHAT_ID и без TG_BOT_TOKEN/TG_CHAT_ID — уведомления выключены")
+
+    # Глобальный throttle: --rate-limit N (RPS) на все HTTP PoC-запросы
+    if args.rate_limit:
+        global RATE_LIMITER
+        RATE_LIMITER = RateLimiter(max(1, args.rate_limit))
+        log_info(f"[Rate] HTTP-запросы PoC ограничены {args.rate_limit}/сек")
 
     if len(targets) == 1:
         run_single_scan(args, targets[0], notifier)
