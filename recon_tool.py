@@ -315,6 +315,125 @@ def clear_resume_state(output_dir, target):
         pass
 
 
+def parse_targets_file(path):
+    """Список целей из файла: по строке (IP/домен/CIDR) или CSV с колонкой
+    target (наш формат разведки: ua-resualt-*.csv)."""
+    targets = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            first = f.readline()
+            f.seek(0)
+            is_csv = first.lower().startswith("scan_order,") or (
+                "," in first and re.match(r"^[a-z_,\s]+$", first.strip().lower()) and "target" in first.lower())
+            if is_csv:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    t = (row.get("target") or row.get("host") or "").strip()
+                    if t:
+                        targets.append(t)
+            else:
+                for line in f:
+                    t = line.strip()
+                    if t and not t.startswith("#"):
+                        targets.append(t)
+    except Exception as e:
+        log_error(f"[Targets] Cannot read {path}: {e}")
+    return list(dict.fromkeys(targets))
+
+
+def expand_cidr(cidr):
+    """CIDR -> список отдельных IP (до /24)."""
+    try:
+        import ipaddress
+        net = ipaddress.ip_network(cidr, strict=False)
+        if net.num_addresses > 256:
+            log_warning(f"[Targets] {cidr} слишком большой (>256 хостов), пропускаю")
+            return []
+        return [str(h) for h in net.hosts()]
+    except Exception:
+        return []
+
+
+def select_targets_from_csv(path, require_site=False, wordpress_only=False,
+                            has_server=False, no_error=True):
+    """Выборка из CSV разведки по фильтрам: только живые сайты / WP /
+    с известным сервером. Возвращает список IP."""
+    selected = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                err = (row.get("error") or "").strip()
+                # error колонка может отсутствовать в битой строке (None)
+                if no_error and (err or row.get("error") is None):
+                    continue
+                if require_site and str(row.get("has_site", "")).strip().lower() != "true":
+                    continue
+                if wordpress_only and str(row.get("is_wordpress", "")).strip().lower() != "true":
+                    continue
+                if has_server and not (row.get("server") or "").strip():
+                    continue
+                t = (row.get("target") or row.get("host") or "").strip()
+                if t and is_ip(t):
+                    selected.append(t)
+    except Exception as e:
+        log_error(f"[Targets] CSV parse error: {e}")
+    return list(dict.fromkeys(selected))
+
+
+class TelegramNotifier:
+    """Уведомления о результатах скана в Telegram.
+    Формат аргумента: --notify BOT_TOKEN:CHAT_ID, либо переменные
+    TG_BOT_TOKEN / TG_CHAT_ID. Отправляет только агрегаты и счётчики —
+    без содержимого цели, кроме её адреса."""
+
+    def __init__(self, spec=None):
+        self.token = None
+        self.chat_id = None
+        spec = spec or ""
+        if ":" in spec:
+            # Telegram-токен сам содержит ":", последний сегмент — chat_id
+            a, _, b = spec.rpartition(":")
+            self.token, self.chat_id = a.strip(), b.strip()
+        self.token = self.token or os.environ.get("TG_BOT_TOKEN")
+        self.chat_id = self.chat_id or os.environ.get("TG_CHAT_ID")
+        self.session = requests.Session()
+        self.session.verify = False
+
+    @property
+    def enabled(self):
+        return bool(self.token and self.chat_id)
+
+    def send(self, text):
+        if not self.enabled:
+            return False
+        try:
+            r = self.session.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={"chat_id": self.chat_id, "text": text[:4000],
+                      "disable_web_page_preview": True},
+                timeout=15)
+            if r.status_code != 200:
+                log_warning(f"[TG] send failed: {r.text[:100]}")
+                return False
+            return True
+        except Exception as e:
+            log_warning(f"[TG] send error: {e}")
+            return False
+
+    def notify_scan_done(self, target, summary, json_file=None):
+        """Финальное резюме по одной цели."""
+        s = summary or {}
+        lines = [f"📊 Скан завершён: {target}",
+                 f"Подтверждённых уязвимостей: {s.get('vulnerable', 0)}",
+                 f"Не уязвимо: {s.get('not_vulnerable', 0)} | "
+                 f"unknown: {s.get('unknown', 0)} | skipped: {s.get('skipped', 0)}",
+                 f"Всего проверок: {s.get('total', 0)}"]
+        if json_file:
+            lines.append(f"Отчёт: {json_file}")
+        return self.send("\n".join(lines))
+
+
 def generate_html_report(results, poc_results, out_file):
     """Человекочитаемый HTML-отчёт с сортировкой PoC по confidence."""
     STATUS_COLORS = {
@@ -3153,9 +3272,9 @@ class PoCVerifier:
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser(description="Reconnaissance Framework v3.0 -- Smart PoC")
-    parser.add_argument("target", help="IP or domain")
+    parser.add_argument("target", nargs="?", default=None, help="IP or domain (или используйте --targets)")
     parser.add_argument("--output-dir", default="recon_results", help="Output directory")
     parser.add_argument("--wordlist", default="/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt", help="Wordlist")
     parser.add_argument("--vhost-wordlist", default="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt", help="VHost wordlist")
@@ -3176,7 +3295,18 @@ def main():
     parser.add_argument("--aggressive", action="store_true", help="Check everything with confidence >= 40 (safe checks)")
     parser.add_argument("--wp-token", default=os.environ.get("WPSCAN_API_TOKEN"), help="WPScan API token (plugin vulns)")
     parser.add_argument("--skip-wp", action="store_true", help="Skip WordPress fingerprinting")
-    args = parser.parse_args()
+    parser.add_argument("--targets", default=None, help="File with targets: CSV (наш формат разведки) или список по строке")
+    parser.add_argument("--only-site", action="store_true", help="From CSV: only targets with has_site=true")
+    parser.add_argument("--only-wordpress", action="store_true", help="From CSV: only WordPress targets")
+    parser.add_argument("--only-server", action="store_true", help="From CSV: only targets with server header")
+    parser.add_argument("--notify", default=None, help="Telegram: BOT_TOKEN:CHAT_ID (или TG_BOT_TOKEN/TG_CHAT_ID)")
+    parser.add_argument("--notify-vulnerable", action="store_true", help="Notify only when scan finds vulnerabilities")
+    return parser
+
+
+def run_single_scan(args, target, notifier=None):
+    """Один прогон по одной цели (тело прежнего main())."""
+    args.target = target
 
     if args.no_color:
         Colors.disable()
@@ -3626,6 +3756,66 @@ def main():
     print()
     # Скан завершён полностью — промежуточный state больше не нужен
     clear_resume_state(args.output_dir, target)
+    # Telegram-уведомление
+    if notifier and notifier.enabled:
+        if not args.notify_vulnerable or (poc_results and poc_results.get("summary", {}).get("vulnerable", 0) > 0):
+            notifier.notify_scan_done(target, poc_results.get("summary") if poc_results else None,
+                                      f"{args.output_dir}/recon_{target}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.no_color:
+        Colors.disable()
+
+    # Список целей: одиночная или --targets (CSV/список) с фильтрами
+    targets = []
+    if args.target:
+        targets = [args.target]
+    elif args.targets:
+        if args.only_site or args.only_wordpress or args.only_server:
+            targets = select_targets_from_csv(args.targets, require_site=args.only_site,
+                                              wordpress_only=args.only_wordpress,
+                                              has_server=args.only_server)
+        else:
+            targets = parse_targets_file(args.targets)
+        # CIDR разворачиваем в отдельные IP
+        expanded = []
+        for t in targets:
+            if "/" in t:
+                expanded.extend(expand_cidr(t))
+            else:
+                expanded.append(t)
+        targets = expanded
+        if not targets:
+            log_error("No targets after parsing/filtering")
+            sys.exit(1)
+    else:
+        parser.error("укажите цель или --targets FILE")
+
+    notifier = TelegramNotifier(args.notify)
+    if args.notify and not notifier.enabled:
+        log_warning("[TG] --notify без BOT_TOKEN:CHAT_ID и без TG_BOT_TOKEN/TG_CHAT_ID — уведомления выключены")
+
+    if len(targets) == 1:
+        run_single_scan(args, targets[0], notifier)
+        return
+
+    log_section(f"BATCH MODE: {len(targets)} targets")
+    for i, t in enumerate(targets, 1):
+        log_info(f"[Batch] {i}/{len(targets)}: {t}")
+        try:
+            run_single_scan(args, t, notifier)
+        except KeyboardInterrupt:
+            log_warning("[Batch] Прервано пользователем")
+            break
+        except Exception as e:
+            log_error(f"[Batch] {t} failed: {e}")
+            if notifier and notifier.enabled:
+                notifier.send(f"❌ Скан {t} упал: {e}")
+    log_success(f"[Batch] Done: {len(targets)} targets")
 
 if __name__ == "__main__":
     main()

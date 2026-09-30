@@ -383,6 +383,73 @@ def test_wp_fingerprint_version():
     assert "contact-form-7" in info["plugins"]
 
 
+CSV_SAMPLE = """scan_order,target,kind,host,has_site,https_status,http_status,ptr,addresses,redirect_domains,tls_domains,server,title,is_wordpress,wordpress_confidence,wordpress_signals,elapsed_ms,error
+1,103.244.145.246,ip,103.244.145.246,False,,,hosted-by.zetservers.com,103.244.145.246,,,,,False,none,,4351,
+2,107.155.71.33,ip,107.155.71.33,True,200,301,107-155-71-33.cprapid.com,107.155.71.33,wreainc.com,,Apache,AI Initiative,True,medium,html:wordpress,12170,
+3,109.108.65.29,ip,109.108.65.29,True,401,,109-108-65-29.kievnet.com.ua,109.108.65.29,,,lighttpd/1.4.39,AiCloud,False,none,,7992,
+4,10.0.0.999,ip,10.0.0.999,True,,,,,,nginx,,True,medium,,100,some error
+"""
+
+
+def test_parse_targets_csv_and_filters():
+    with open("/tmp/recon_test_targets.csv", "w") as f:
+        f.write(CSV_SAMPLE)
+    # Все цели (без ошибок)
+    all_t = rt.select_targets_from_csv("/tmp/recon_test_targets.csv")
+    assert "103.244.145.246" in all_t and "107.155.71.33" in all_t
+    assert "10.0.0.999" not in all_t  # строка с error отфильтрована
+    # Только сайты
+    sites = rt.select_targets_from_csv("/tmp/recon_test_targets.csv", require_site=True)
+    assert "103.244.145.246" not in sites  # has_site=False
+    assert "107.155.71.33" in sites
+    # Только WordPress
+    wp = rt.select_targets_from_csv("/tmp/recon_test_targets.csv", wordpress_only=True)
+    assert wp == ["107.155.71.33"]
+    # Только с известным сервером
+    srv = rt.select_targets_from_csv("/tmp/recon_test_targets.csv", has_server=True)
+    assert "109.108.65.29" in srv and "103.244.145.246" not in srv
+    # Обычный файл со списком
+    with open("/tmp/recon_test_targets.txt", "w") as f:
+        f.write("# comment\nexample.com\n1.2.3.4\n\nexample.com\n")
+    lst = rt.parse_targets_file("/tmp/recon_test_targets.txt")
+    assert lst == ["example.com", "1.2.3.4"]  # dedup, без комментариев
+    # CSV как источник тоже парсится общим парсером
+    assert len(rt.parse_targets_file("/tmp/recon_test_targets.csv")) == 4
+    os.remove("/tmp/recon_test_targets.csv")
+    os.remove("/tmp/recon_test_targets.txt")
+
+
+def test_expand_cidr():
+    hosts = rt.expand_cidr("192.168.1.0/30")
+    assert hosts == ["192.168.1.1", "192.168.1.2"]
+    assert rt.expand_cidr("not-a-cidr") == []
+    assert rt.expand_cidr("10.0.0.0/8") == []  # слишком большая сеть
+
+
+def test_telegram_notifier_disabled_and_payload():
+    # Без токена — выключен и ничего не отправляет
+    n = rt.TelegramNotifier("")
+    assert not n.enabled
+    assert n.send("test") is False
+    # Спарсенный аргумент
+    n2 = rt.TelegramNotifier("123456:ABC-DEF:98765")
+    assert n2.token == "123456:ABC-DEF" and n2.chat_id == "98765"
+    assert n2.enabled
+    # Проверяем payload без реальной отправки: подменяем session
+    sent = []
+    class FakeSess:
+        def post(self, url, json=None, timeout=None):
+            sent.append((url, json))
+            return FakeResponse(200)
+    n2.session = FakeSess()
+    n2.notify_scan_done("example.com", {"vulnerable": 2, "not_vulnerable": 5,
+                                         "unknown": 1, "skipped": 10, "total": 18})
+    url, payload = sent[0]
+    assert url == "https://api.telegram.org/bot123456:ABC-DEF/sendMessage"
+    assert payload["chat_id"] == "98765"
+    assert "example.com" in payload["text"] and "2" in payload["text"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
