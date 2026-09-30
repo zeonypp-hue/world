@@ -3410,6 +3410,8 @@ def build_arg_parser():
     parser.add_argument("--notify-vulnerable", action="store_true", help="Notify only when scan finds vulnerabilities")
     parser.add_argument("--notify-threshold", type=int, default=70,
                         help="Confidence threshold (0-100) for useful-finding notifications (default 70)")
+    parser.add_argument("--batch-threads", type=int, default=1,
+                        help="Parallel scans in batch mode (1-5, default 1)")
     return parser
 
 
@@ -3931,17 +3933,34 @@ def main():
         return
 
     log_section(f"BATCH MODE: {len(targets)} targets")
-    for i, t in enumerate(targets, 1):
-        log_info(f"[Batch] {i}/{len(targets)}: {t}")
+    n_workers = max(1, min(5, args.batch_threads))
+    if n_workers > 1:
+        log_info(f"[Batch] {n_workers} параллельных сканов")
+    done_count = [0]
+    lock_print = __import__("threading").Lock()
+
+    def scan_one(t):
         try:
             run_single_scan(args, t, notifier)
         except KeyboardInterrupt:
-            log_warning("[Batch] Прервано пользователем")
-            break
+            log_warning(f"[Batch] {t}: прервано пользователем")
         except Exception as e:
             log_error(f"[Batch] {t} failed: {e}")
             if notifier and notifier.enabled:
                 notifier.send(f"❌ Скан {t} упал: {e}")
+        finally:
+            with lock_print:
+                done_count[0] += 1
+                log_info(f"[Batch] Готово {done_count[0]}/{len(targets)} ({t})")
+
+    if n_workers == 1:
+        for t in targets:
+            scan_one(t)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = [ex.submit(scan_one, t) for t in targets]
+            for f in as_completed(futures):
+                f.result()
     log_success(f"[Batch] Done: {len(targets)} targets")
     bot_command_loop(notifier)
 
