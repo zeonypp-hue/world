@@ -433,6 +433,113 @@ class TelegramNotifier:
             lines.append(f"Отчёт: {json_file}")
         return self.send("\n".join(lines))
 
+    def send_document(self, path, caption=""):
+        """Отправка файла (HTML/JSON отчёт) в чат."""
+        if not self.enabled:
+            return False
+        try:
+            with open(path, "rb") as f:
+                r = self.session.post(
+                    f"https://api.telegram.org/bot{self.token}/sendDocument",
+                    data={"chat_id": self.chat_id, "caption": caption[:1000]},
+                    files={"document": (os.path.basename(path), f)},
+                    timeout=120)
+                if r.status_code != 200:
+                    log_warning(f"[TG] sendDocument failed: {r.text[:100]}")
+                    return False
+            return True
+        except Exception as e:
+            log_warning(f"[TG] sendDocument error: {e}")
+            return False
+
+    def get_updates(self, offset=None, timeout=25):
+        """long-polling обновлений (команды из чата)."""
+        if not self.enabled:
+            return []
+        try:
+            r = self.session.get(
+                f"https://api.telegram.org/bot{self.token}/getUpdates",
+                params={"timeout": timeout, **({"offset": offset} if offset else {})},
+                timeout=timeout + 10)
+            if r.status_code != 200:
+                return []
+            return r.json().get("result", [])
+        except Exception:
+            return []
+
+
+SCAN_REGISTRY = {}  # target -> {"json": path, "html": path, "summary": {...}}
+
+
+def bot_command_loop(notifier):
+    """Интерактивный режим после скана: бот отвечает на команды из чата.
+    /list — цели; /report <target> — HTML+JSON; /summary <target>;
+    /status — сводка по всем; /exit — завершить."""
+    if not (notifier and notifier.enabled):
+        return
+    log_section("TELEGRAM BOT: COMMAND MODE")
+    notifier.send("🤖 Бот на связи. Команды:\n"
+                  "/list — список отсканированных целей\n"
+                  "/report <цель> — прислать HTML+JSON отчёт\n"
+                  "/summary <цель> — сводка\n"
+                  "/status — сводка по всем целям\n"
+                  "/exit — завершить (или Ctrl+C)")
+    offset = None
+    while True:
+        updates = notifier.get_updates(offset)
+        if not updates:
+            continue
+        for u in updates:
+            offset = u["update_id"] + 1
+            msg = (u.get("message") or {})
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            parts = text.split()
+            cmd = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
+            if cmd == "/list":
+                if SCAN_REGISTRY:
+                    notifier.send("Отсканированные цели:\n" +
+                                  "\n".join(f"• {t}" for t in SCAN_REGISTRY))
+                else:
+                    notifier.send("Пока ничего не отсканировано")
+            elif cmd == "/report":
+                if arg not in SCAN_REGISTRY:
+                    notifier.send(f"Цель не найдена: {arg}. /list — что есть")
+                    continue
+                reg = SCAN_REGISTRY[arg]
+                sent = []
+                if reg.get("html") and os.path.exists(reg["html"]):
+                    notifier.send_document(reg["html"], f"HTML отчёт: {arg}")
+                    sent.append("HTML")
+                if reg.get("json") and os.path.exists(reg["json"]):
+                    notifier.send_document(reg["json"], f"JSON отчёт: {arg}")
+                    sent.append("JSON")
+                notifier.send(f"Отправлено: {', '.join(sent) if sent else 'ничего (файлы не найдены)'}")
+            elif cmd == "/summary":
+                reg = SCAN_REGISTRY.get(arg)
+                if not reg:
+                    notifier.send(f"Цель не найдена: {arg}")
+                else:
+                    s = reg.get("summary") or {}
+                    notifier.send(f"📊 {arg}\nПодтверждённых: {s.get('vulnerable', 0)} | "
+                                  f"не уязвимо: {s.get('not_vulnerable', 0)} | "
+                                  f"unknown: {s.get('unknown', 0)}")
+            elif cmd == "/status":
+                if not SCAN_REGISTRY:
+                    notifier.send("Пусто")
+                else:
+                    total_v = sum((r.get("summary") or {}).get("vulnerable", 0)
+                                   for r in SCAN_REGISTRY.values())
+                    notifier.send(f"Целей: {len(SCAN_REGISTRY)}, "
+                                  f"суммарно подтверждённых уязвимостей: {total_v}")
+            elif cmd in ("/exit", "/stop", "/quit"):
+                notifier.send("Завершаю режим команд. Пока!")
+                return
+            elif cmd == "/start" or cmd == "/help":
+                notifier.send("Команды: /list, /report <цель>, /summary <цель>, /status, /exit")
+
 
 def generate_html_report(results, poc_results, out_file):
     """Человекочитаемый HTML-отчёт с сортировкой PoC по confidence."""
@@ -3301,6 +3408,8 @@ def build_arg_parser():
     parser.add_argument("--only-server", action="store_true", help="From CSV: only targets with server header")
     parser.add_argument("--notify", default=None, help="Telegram: BOT_TOKEN:CHAT_ID (или TG_BOT_TOKEN/TG_CHAT_ID)")
     parser.add_argument("--notify-vulnerable", action="store_true", help="Notify only when scan finds vulnerabilities")
+    parser.add_argument("--notify-threshold", type=int, default=70,
+                        help="Confidence threshold (0-100) for useful-finding notifications (default 70)")
     return parser
 
 
@@ -3756,11 +3865,28 @@ def run_single_scan(args, target, notifier=None):
     print()
     # Скан завершён полностью — промежуточный state больше не нужен
     clear_resume_state(args.output_dir, target)
-    # Telegram-уведомление
+    # Регистрация отчётов для Telegram-бота (/report)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    reg = {"summary": (poc_results or {}).get("summary", {}),
+           "json": f"{args.output_dir}/recon_{target}_{ts}.json",
+           "html": f"{args.output_dir}/recon_{target}_{ts}.html"}
+    SCAN_REGISTRY[target] = reg
+    # Telegram: полезные находки (vulnerable с confidence >= порога)
+    if notifier and notifier.enabled:
+        threshold = getattr(args, "notify_threshold", 70)
+        found = [c for c in (poc_results or {}).get("main", [])
+                 if isinstance(c, dict) and c.get("status") == "vulnerable"
+                 and (c.get("confidence") or 0) >= threshold]
+        if found:
+            lines = [f"🚨 Полезные находки по {target} (confidence ≥ {threshold}):"]
+            for c in found[:10]:
+                lines.append(f"• {c.get('vulnerability')} — conf {c.get('confidence')}/100 "
+                             f"({c.get('method')})")
+            notifier.send("\n".join(lines))
     if notifier and notifier.enabled:
         if not args.notify_vulnerable or (poc_results and poc_results.get("summary", {}).get("vulnerable", 0) > 0):
             notifier.notify_scan_done(target, poc_results.get("summary") if poc_results else None,
-                                      f"{args.output_dir}/recon_{target}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+                                      reg["json"])
 
 
 def main():
@@ -3801,6 +3927,7 @@ def main():
 
     if len(targets) == 1:
         run_single_scan(args, targets[0], notifier)
+        bot_command_loop(notifier)
         return
 
     log_section(f"BATCH MODE: {len(targets)} targets")
@@ -3816,6 +3943,7 @@ def main():
             if notifier and notifier.enabled:
                 notifier.send(f"❌ Скан {t} упал: {e}")
     log_success(f"[Batch] Done: {len(targets)} targets")
+    bot_command_loop(notifier)
 
 if __name__ == "__main__":
     main()

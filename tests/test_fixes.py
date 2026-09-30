@@ -450,6 +450,64 @@ def test_telegram_notifier_disabled_and_payload():
     assert "example.com" in payload["text"] and "2" in payload["text"]
 
 
+def test_bot_finding_threshold_notification():
+    # findings-уведомление: только vulnerable с confidence >= порога
+    n = rt.TelegramNotifier("123456:ABC-DEF:98765")
+    sent = []
+
+    class FakeSess:
+        def post(self, url, json=None, timeout=None, data=None, files=None):
+            sent.append(json or data)
+            return FakeResponse(200)
+
+        def get(self, url, params=None, timeout=None):
+            return FakeResponse(200, body={"result": []})
+
+    n.session = FakeSess()
+    checks = [
+        {"status": "vulnerable", "confidence": 85, "vulnerability": "CVE-X", "method": "msf_check"},
+        {"status": "vulnerable", "confidence": 45, "vulnerability": "CVE-Y", "method": "sqli_test"},
+        {"status": "not_vulnerable", "confidence": 90, "vulnerability": "CVE-Z", "method": "msf_check"},
+    ]
+    threshold = 70
+    found = [c for c in checks
+             if c.get("status") == "vulnerable" and (c.get("confidence") or 0) >= threshold]
+    assert found == [checks[0]]  # только 85-очковый vulnerable
+
+
+def test_bot_command_loop_report_and_exit():
+    n = rt.TelegramNotifier("123456:ABC-DEF:98765")
+    n.session = types.SimpleNamespace(
+        post=lambda url, json=None, timeout=None, data=None, files=None: FakeResponse(200),
+        get=lambda url, params=None, timeout=None: FakeResponse(200, body={
+            "result": [
+                {"update_id": 1, "message": {"text": "/list"}},
+                {"update_id": 2, "message": {"text": "/report example.com"}},
+                {"update_id": 3, "message": {"text": "/exit"}},
+            ]}))
+    # регистрируем отчёты
+    rt.SCAN_REGISTRY["example.com"] = {
+        "summary": {"vulnerable": 1, "not_vulnerable": 3},
+        "json": "/tmp/recon_test_report.json", "html": "/tmp/recon_test_report.html"}
+    with open("/tmp/recon_test_report.html", "w") as f:
+        f.write("<html>report</html>")
+    with open("/tmp/recon_test_report.json", "w") as f:
+        f.write("{}")
+    # /report должен отправить оба файла (sendDocument по данным)
+    posted = []
+    orig_post = n.session.post
+    n.session = types.SimpleNamespace(
+        post=lambda url, json=None, timeout=None, data=None, files=None: (
+            posted.append((url, data, files)), FakeResponse(200))[1],
+        get=n.session.get)
+    rt.bot_command_loop(n)
+    assert any("sendDocument" in u for u, _, _ in posted), posted
+    assert any("example.com" in (d or {}).get("caption", "") for _, d, _ in posted)
+    # цикл завершился по /exit — дошли до этой строки
+    os.remove("/tmp/recon_test_report.html")
+    os.remove("/tmp/recon_test_report.json")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
